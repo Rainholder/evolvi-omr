@@ -16,6 +16,7 @@ Sheet layout (fixed):
 """
 
 import base64
+import io
 import json
 import logging
 import os
@@ -24,7 +25,9 @@ import traceback
 
 import cv2
 import numpy as np
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
+
+from generate_sheet import build_sheet, compute_sheet_coords, parse_exam_code, EXAM_TITLES
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -694,6 +697,94 @@ def debug():
         "marker_area_range": [_MARKER_AREA_MIN, _MARKER_AREA_MAX],
         "marker_thresholds": marker_stats,
         "hough_attempts":  hough_counts,
+    }), 200
+
+
+@app.route("/sheet/<exam_code>", methods=["GET"])
+def get_sheet(exam_code: str):
+    """
+    Generate and return the answer-sheet PDF for the given exam code.
+
+    Also saves the bubble coordinates to sheet_coords.json so /procesar
+    can use them without calling /setup-template on a template photo.
+
+    Path param:
+        exam_code : e.g. EV-ATR-JUN26  or  BIO  or  FIS
+
+    Response: PDF file (Content-Disposition: attachment)
+
+    Side-effect: writes sheet_coords.json to the working directory.
+    """
+    log.info("GET /sheet/%s", exam_code)
+
+    try:
+        pdf_bytes, sheet_coords = build_sheet(exam_code)
+    except Exception as exc:
+        log.error("Sheet generation failed: %s\n%s", exc, traceback.format_exc())
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    # Persist coords so the OMR pipeline can load them directly
+    coords_path = "sheet_coords.json"
+    try:
+        with open(coords_path, "w") as f:
+            json.dump({"exam_code": exam_code.upper(), "coords": sheet_coords}, f)
+        log.info("Saved %d question coords to %s", len(sheet_coords), coords_path)
+    except Exception as exc:
+        log.warning("Could not save sheet_coords.json: %s", exc)
+
+    safe_code = exam_code.upper().replace("/", "-").replace(" ", "_")
+    return send_file(
+        io.BytesIO(pdf_bytes),
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=f"hoja_{safe_code}.pdf",
+    )
+
+
+@app.route("/coords/<exam_code>", methods=["GET"])
+def get_coords(exam_code: str):
+    """
+    Return the SHEET_COORDS JSON for the given exam code.
+
+    Generates the coordinates on the fly (same geometry as /sheet/<exam_code>).
+    Does NOT generate the full PDF — fast, stateless.
+
+    Response:
+        {
+          "ok": true,
+          "exam_code": "EV-ATR-JUN26",
+          "title": "ÁREAS TRANSVERSALES",
+          "total_questions": 90,
+          "bubble_radius_px": 42,
+          "coords": {
+            "1":  {"A": [242, 1550], "B": [363, 1550], "C": [484, 1550]},
+            ...
+            "90": {"A": [...], "B": [...], "C": [...]}
+          }
+        }
+    """
+    log.info("GET /coords/%s", exam_code)
+
+    try:
+        info   = parse_exam_code(exam_code)
+        coords = compute_sheet_coords()
+    except Exception as exc:
+        log.error("Coords computation failed: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    # Bubble radius in pixels at 300 DPI (R_RESP = 10 pt)
+    from generate_sheet import R_RESP, PT_PX
+    r_px = round(R_RESP * PT_PX)
+
+    return jsonify({
+        "ok":             True,
+        "exam_code":      info["code"],
+        "title":          info["title"],
+        "total_questions": len(coords),
+        "bubble_radius_px": r_px,
+        "dpi":            300,
+        "image_size_px":  [2550, 3300],
+        "coords":         coords,
     }), 200
 
 
