@@ -63,9 +63,10 @@ FILL_THRESHOLD = 0.18
 #   TEMPLATE_DIMS    : tuple (width_px, height_px) of the coordinate space
 #   COORDS_SOURCE    : str   how the state was populated
 # ---------------------------------------------------------------------------
-TEMPLATE_CIRCLES: dict | None = None
-TEMPLATE_DIMS:    tuple | None = None
-COORDS_SOURCE:    str          = "none"   # "setup_template" | "sheet_coords" | "none"
+TEMPLATE_CIRCLES:     dict | None = None
+TEMPLATE_DIMS:        tuple | None = None
+COORDS_SOURCE:        str          = "none"   # "setup_template" | "sheet_coords" | "none"
+LAST_PERSPECTIVE_MODE: str         = "none"   # "markers" | "edge_detection" | "resize_only"
 
 # On-disk state files
 _STATE_FILE        = "template_state.json"   # HoughCircles state (highest accuracy)
@@ -266,6 +267,24 @@ def _pick_nearest_to_corners(candidates: list, w: int, h: int) -> np.ndarray:
     return np.array(result, dtype=np.float32)
 
 
+def _order_corners(pts: np.ndarray) -> np.ndarray:
+    """
+    Order 4 corner points as TL, TR, BR, BL.
+
+    Uses the standard sum/diff trick:
+      TL = min(x+y)   BR = max(x+y)
+      TR = min(y-x)   BL = max(y-x)
+    """
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s    = pts.sum(axis=1)
+    d    = pts[:, 1] - pts[:, 0]
+    rect[0] = pts[np.argmin(s)]   # TL
+    rect[1] = pts[np.argmin(d)]   # TR
+    rect[2] = pts[np.argmax(s)]   # BR
+    rect[3] = pts[np.argmax(d)]   # BL
+    return rect
+
+
 def find_corner_markers(gray: np.ndarray) -> np.ndarray:
     """
     Locate 4 solid black square corner markers using thresholds 50 → 80 → 100.
@@ -296,6 +315,61 @@ def find_corner_markers(gray: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Fallback: paper-edge detection via Canny + contour approximation
+# ---------------------------------------------------------------------------
+def _find_page_corners_by_edges(gray: np.ndarray) -> np.ndarray | None:
+    """
+    Locate the paper boundary using Canny edge detection.
+
+    Strategy:
+      1. Blur → Canny(50,150) → dilate to close gaps.
+      2. Find external contours; sort by area descending.
+      3. For each large contour try approxPolyDP with several epsilon factors
+         until we get exactly 4 vertices.
+      4. Order them TL/TR/BR/BL with _order_corners().
+
+    Returns (4, 2) float32 or None if no valid quadrilateral is found.
+    """
+    h, w    = gray.shape
+    min_area = h * w * 0.20   # paper must cover ≥ 20 % of the frame
+
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges   = cv2.Canny(blurred, 50, 150)
+
+    # Dilate to close small gaps along sheet edges
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges  = cv2.dilate(edges, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Check only the 10 largest contours to keep it fast
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            break   # sorted — remainder will also be too small
+
+        peri = cv2.arcLength(cnt, True)
+        for eps in (0.02, 0.015, 0.03, 0.04):
+            approx = cv2.approxPolyDP(cnt, eps * peri, True)
+            if len(approx) == 4:
+                pts     = approx.reshape(4, 2).astype(np.float32)
+                ordered = _order_corners(pts)
+                log.info(
+                    "Edge detection: page found — area=%.0f eps=%.3f corners=%s",
+                    area, eps, ordered.tolist(),
+                )
+                return ordered
+
+    log.warning(
+        "Edge detection: no 4-vertex contour ≥ %.0f px² found (checked %d contours)",
+        min_area, len(contours),
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Perspective correction
 # ---------------------------------------------------------------------------
 def warp_to_template(img: np.ndarray, corners: np.ndarray) -> np.ndarray:
@@ -311,6 +385,17 @@ def warp_to_template(img: np.ndarray, corners: np.ndarray) -> np.ndarray:
     warped = cv2.warpPerspective(img, M, (tw, th))
     log.debug("Warped to template size (%d × %d)", tw, th)
     return warped
+
+
+def _warp_by_resize(img: np.ndarray) -> np.ndarray:
+    """
+    Last-resort alignment: scale the image directly to TEMPLATE_DIMS.
+    No perspective correction — assumes the photo is already roughly frontal.
+    """
+    tw, th  = TEMPLATE_DIMS
+    resized = cv2.resize(img, (tw, th), interpolation=cv2.INTER_LANCZOS4)
+    log.info("Fallback resize to (%d x %d) — no perspective correction", tw, th)
+    return resized
 
 
 # ---------------------------------------------------------------------------
@@ -523,38 +608,73 @@ def read_bubbles(binary_warped: np.ndarray, circles_map: dict, total_preguntas: 
 # Core OMR pipeline
 # ---------------------------------------------------------------------------
 def process_omr(img: np.ndarray, total_preguntas: int) -> dict:
+    """
+    Full OMR pipeline with a 3-stage perspective correction fallback.
+
+    Stage 1 — Corner markers:
+        Detect the 4 solid black square corner markers and warpPerspective.
+    Stage 2 — Edge detection:
+        If marker detection fails, locate the paper boundary via Canny edges
+        and warpPerspective using the detected quadrilateral corners.
+    Stage 3 — Resize only:
+        If edge detection also fails, scale the image directly to TEMPLATE_DIMS
+        assuming the photo is already roughly frontal.
+
+    The active stage is recorded in LAST_PERSPECTIVE_MODE.
+    """
+    global LAST_PERSPECTIVE_MODE
+
     if TEMPLATE_CIRCLES is None:
         raise RuntimeError(
-            "No template loaded. Call POST /setup-template with the blank "
-            "template image before processing student sheets."
+            "No coords loaded. Call POST /setup-template or GET /sheet/<exam_code> first."
         )
 
-    # 1. Grayscale
+    # ── 1. Grayscale (shared across all stages) ──────────────────────────────
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # 2. Detect corner markers
-    corners = find_corner_markers(gray)
+    # ── Stage 1: corner markers ───────────────────────────────────────────────
+    warped_color     = None
+    perspective_mode = "markers"
+    try:
+        corners      = find_corner_markers(gray)
+        warped_color = warp_to_template(img, corners)
+        log.info("Perspective correction: corner markers")
+    except RuntimeError as exc:
+        log.warning("Corner markers failed (%s) — trying edge detection", exc)
 
-    # 3. Warp to template dimensions
-    warped_color = warp_to_template(img, corners)
+    # ── Stage 2: Canny paper-edge detection ───────────────────────────────────
+    if warped_color is None:
+        corners = _find_page_corners_by_edges(gray)
+        if corners is not None:
+            warped_color     = warp_to_template(img, corners)
+            perspective_mode = "edge_detection"
+            log.info("Perspective correction: edge detection")
+        else:
+            log.warning("Edge detection failed — falling back to resize only")
 
-    # 4. Binarise warped image for bubble reading (Otsu on blurred gray)
+    # ── Stage 3: resize only ──────────────────────────────────────────────────
+    if warped_color is None:
+        warped_color     = _warp_by_resize(img)
+        perspective_mode = "resize_only"
+
+    LAST_PERSPECTIVE_MODE = perspective_mode
+
+    # ── Binarise (Otsu on blurred gray) ──────────────────────────────────────
     warped_gray = cv2.cvtColor(warped_color, cv2.COLOR_BGR2GRAY)
     blurred     = cv2.GaussianBlur(warped_gray, (5, 5), 0)
     _, warped_bin = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    log.debug("Otsu threshold applied to warped image")
 
-    # 5. Read bubbles at template positions
-    respuestas = read_bubbles(warped_bin, TEMPLATE_CIRCLES, total_preguntas)
-
+    # ── Read bubbles ──────────────────────────────────────────────────────────
+    respuestas       = read_bubbles(warped_bin, TEMPLATE_CIRCLES, total_preguntas)
     total_detectadas = sum(1 for v in respuestas.values() if v is not None)
-    confianza = round(total_detectadas / total_preguntas, 4) if total_preguntas else 0.0
+    confianza        = round(total_detectadas / total_preguntas, 4) if total_preguntas else 0.0
 
     return {
-        "ok": True,
-        "respuestas": respuestas,
+        "ok":               True,
+        "respuestas":       respuestas,
         "total_detectadas": total_detectadas,
-        "confianza": confianza,
+        "confianza":        confianza,
+        "perspective_mode": perspective_mode,
     }
 
 
@@ -918,11 +1038,12 @@ def get_coords(exam_code: str):
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
-        "status":          "ok",
-        "service":         "evolvi-omr",
-        "template_loaded": TEMPLATE_CIRCLES is not None,
-        "source":          COORDS_SOURCE,
-        "questions_ready": len(TEMPLATE_CIRCLES) if TEMPLATE_CIRCLES else 0,
+        "status":           "ok",
+        "service":          "evolvi-omr",
+        "template_loaded":  TEMPLATE_CIRCLES is not None,
+        "source":           COORDS_SOURCE,
+        "questions_ready":  len(TEMPLATE_CIRCLES) if TEMPLATE_CIRCLES else 0,
+        "perspective_mode": LAST_PERSPECTIVE_MODE,
     }), 200
 
 
