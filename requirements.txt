@@ -3,3 +3,5 @@ opencv-python-headless
 numpy
 gunicorn
 reportlab
+pdf2image
+Pillow

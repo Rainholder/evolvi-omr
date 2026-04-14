@@ -66,11 +66,16 @@ FILL_THRESHOLD = 0.18
 TEMPLATE_CIRCLES:     dict | None = None
 TEMPLATE_DIMS:        tuple | None = None
 COORDS_SOURCE:        str          = "none"   # "setup_template" | "sheet_coords" | "none"
-LAST_PERSPECTIVE_MODE: str         = "none"   # "markers" | "edge_detection" | "resize_only"
+LAST_PERSPECTIVE_MODE: str         = "none"   # "markers" | "orb" | "edge_detection" | "resize_only"
 
 # On-disk state files
 _STATE_FILE        = "template_state.json"   # HoughCircles state (highest accuracy)
 _SHEET_COORDS_FILE = "sheet_coords.json"     # PDF-geometry coords (auto-loaded fallback)
+
+# ORB feature matching template image
+_TEMPLATE_IMAGE_FILE = "template_image.png"
+_TEMPLATE_IMAGE: np.ndarray | None = None    # rendered reference image for ORB alignment
+_last_orb_viz:   np.ndarray | None = None    # last drawMatches output for /debug-visual
 
 # Standard Letter page at 300 DPI — matches generate_sheet coordinate space
 _LETTER_W_PX = 2550
@@ -157,9 +162,70 @@ def _load_sheet_coords_file(path: str) -> bool:
             "Sheet coords loaded from %s — %d questions, r=%d px, dims=%s",
             path, len(circles), r_sample, TEMPLATE_DIMS,
         )
+        # Try to populate _TEMPLATE_IMAGE for ORB alignment:
+        # 1. Load existing PNG from disk (fast, no poppler needed)
+        # 2. Render from PDF using pdf2image if exam_code is known
+        if not _load_template_image_file():
+            exam_code_in_file = data.get("exam_code")
+            if exam_code_in_file:
+                _render_template_image(exam_code_in_file)
         return True
     except Exception as exc:
         log.warning("Could not load sheet coords from %s: %s", path, exc)
+        return False
+
+
+def _load_template_image_file() -> bool:
+    """
+    Load a pre-rendered reference image from template_image.png into _TEMPLATE_IMAGE.
+    Returns True on success, False if the file is absent or unreadable.
+    """
+    global _TEMPLATE_IMAGE
+    if not os.path.exists(_TEMPLATE_IMAGE_FILE):
+        return False
+    try:
+        img = cv2.imread(_TEMPLATE_IMAGE_FILE)
+        if img is None:
+            log.warning("cv2.imread returned None for %s", _TEMPLATE_IMAGE_FILE)
+            return False
+        _TEMPLATE_IMAGE = img
+        log.info(
+            "ORB template image loaded from %s — shape=%s",
+            _TEMPLATE_IMAGE_FILE, img.shape,
+        )
+        return True
+    except Exception as exc:
+        log.warning("Could not load template image from %s: %s", _TEMPLATE_IMAGE_FILE, exc)
+        return False
+
+
+def _render_template_image(exam_code: str) -> bool:
+    """
+    Render the answer-sheet PDF for exam_code to a PNG at 150 DPI, save it as
+    template_image.png, and load it into _TEMPLATE_IMAGE.
+
+    Requires pdf2image (poppler) to be installed.
+    Returns True on success, False on any error (non-fatal).
+    """
+    global _TEMPLATE_IMAGE
+    try:
+        from pdf2image import convert_from_bytes  # noqa: PLC0415
+        pdf_bytes, _ = build_sheet(exam_code)
+        pages = convert_from_bytes(pdf_bytes, dpi=150)
+        if not pages:
+            log.warning("pdf2image returned no pages for exam_code=%s", exam_code)
+            return False
+        img_np = np.array(pages[0].convert("RGB"))
+        bgr    = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(_TEMPLATE_IMAGE_FILE, bgr)
+        _TEMPLATE_IMAGE = bgr
+        log.info(
+            "ORB template image rendered for %s — shape=%s, saved to %s",
+            exam_code, bgr.shape, _TEMPLATE_IMAGE_FILE,
+        )
+        return True
+    except Exception as exc:
+        log.warning("Could not render template image for %s: %s", exam_code, exc)
         return False
 
 
@@ -170,8 +236,11 @@ def _bootstrap() -> None:
     Priority:
       1. template_state.json  (HoughCircles — highest positional accuracy)
       2. sheet_coords.json    (PDF-geometry — no template photo required)
+
+    Also loads template_image.png for ORB feature matching if available.
     """
     if _load_template_state():
+        _load_template_image_file()
         return
     if _load_sheet_coords_file(_SHEET_COORDS_FILE):
         return
@@ -179,6 +248,8 @@ def _bootstrap() -> None:
         "No coords loaded at startup. Call POST /setup-template or "
         "GET /sheet/<exam_code> to generate sheet_coords.json."
     )
+    # Still try to load any previously rendered template image
+    _load_template_image_file()
 
 
 _bootstrap()
@@ -398,6 +469,125 @@ def _warp_by_resize(img: np.ndarray) -> np.ndarray:
     return resized
 
 
+def _warp_by_orb(
+    img: np.ndarray,
+) -> tuple["np.ndarray | None", "np.ndarray | None"]:
+    """
+    Align a student photo to the template reference using ORB feature matching.
+
+    Steps:
+      1. Resize both images to MAX_DIM (1100 px on the long side) for speed.
+      2. Detect ORB keypoints + descriptors on both.
+      3. BFMatcher (NORM_HAMMING) + knnMatch, Lowe ratio test 0.75.
+      4. findHomography (RANSAC) on good matches.
+      5. Scale the small-image homography up to full TEMPLATE_DIMS:
+           H_full = S_tpl_inv @ H_small @ S_img
+      6. warpPerspective(img, H_full, TEMPLATE_DIMS).
+
+    Returns:
+        (warped_color, student_corners_in_original)
+        Both are None on failure (too few keypoints/matches/inliers).
+    """
+    global _last_orb_viz
+    _last_orb_viz = None
+
+    if _TEMPLATE_IMAGE is None:
+        log.warning("ORB: no template image — skipping")
+        return None, None
+
+    tw, th = TEMPLATE_DIMS
+    MAX_DIM = 1100
+
+    # ── Scale both images down for feature matching ──────────────────────────
+    img_h, img_w = img.shape[:2]
+    img_scale    = MAX_DIM / max(img_h, img_w)
+    small_img    = cv2.resize(img,
+                              (int(img_w * img_scale), int(img_h * img_scale)),
+                              interpolation=cv2.INTER_AREA)
+
+    tpl_h, tpl_w = _TEMPLATE_IMAGE.shape[:2]
+    tpl_scale    = MAX_DIM / max(tpl_h, tpl_w)
+    small_tpl    = cv2.resize(_TEMPLATE_IMAGE,
+                              (int(tpl_w * tpl_scale), int(tpl_h * tpl_scale)),
+                              interpolation=cv2.INTER_AREA)
+
+    # ── ORB keypoints ─────────────────────────────────────────────────────────
+    orb      = cv2.ORB_create(nfeatures=2000)
+    gray_img = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
+    gray_tpl = cv2.cvtColor(small_tpl, cv2.COLOR_BGR2GRAY)
+    kp_img, des_img = orb.detectAndCompute(gray_img, None)
+    kp_tpl, des_tpl = orb.detectAndCompute(gray_tpl, None)
+
+    n_img = len(kp_img) if kp_img else 0
+    n_tpl = len(kp_tpl) if kp_tpl else 0
+    log.info("ORB keypoints: student=%d  template=%d", n_img, n_tpl)
+
+    if des_img is None or des_tpl is None or n_img < 10 or n_tpl < 10:
+        log.warning("ORB: insufficient keypoints (student=%d, template=%d)", n_img, n_tpl)
+        return None, None
+
+    # ── BFMatcher + ratio test ────────────────────────────────────────────────
+    bf         = cv2.BFMatcher(cv2.NORM_HAMMING)
+    raw_pairs  = bf.knnMatch(des_img, des_tpl, k=2)
+    good       = [m for m, n in raw_pairs if m.distance < 0.75 * n.distance]
+    log.info("ORB matches: %d raw → %d good (ratio 0.75)", len(raw_pairs), len(good))
+
+    if len(good) < 10:
+        log.warning("ORB: too few good matches (%d < 10)", len(good))
+        return None, None
+
+    # ── Homography in small-image space ──────────────────────────────────────
+    src_pts = np.float32([kp_img[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp_tpl[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    H_small, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
+    if H_small is None:
+        log.warning("ORB: findHomography returned None")
+        return None, None
+
+    inliers = int(mask.sum()) if mask is not None else 0
+    log.info("ORB: homography inliers=%d / %d matches", inliers, len(good))
+
+    if inliers < 8:
+        log.warning("ORB: too few inliers (%d < 8)", inliers)
+        return None, None
+
+    # ── Scale homography to full resolution ──────────────────────────────────
+    # H_full maps original-student-coords → original-template-coords
+    # H_full = S_tpl_inv  @  H_small  @  S_img
+    S_img = np.array([[img_scale, 0,         0],
+                      [0,         img_scale, 0],
+                      [0,         0,         1]], dtype=np.float64)
+    S_tpl_inv = np.array([[1.0 / tpl_scale, 0,               0],
+                          [0,               1.0 / tpl_scale, 0],
+                          [0,               0,               1]], dtype=np.float64)
+    H_full = S_tpl_inv @ H_small.astype(np.float64) @ S_img
+
+    # ── Warp student image to template canvas ────────────────────────────────
+    warped = cv2.warpPerspective(img, H_full, (tw, th))
+
+    # ── Save match visualisation for /debug-visual ───────────────────────────
+    inlier_matches = [m for m, keep in zip(good, mask.ravel()) if keep] if mask is not None else good
+    _last_orb_viz = cv2.drawMatches(
+        small_img, kp_img,
+        small_tpl, kp_tpl,
+        inlier_matches[:60], None,
+        matchColor=(0, 255, 0),
+        singlePointColor=(180, 180, 180),
+        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
+    )
+
+    # ── Compute student-image corners (for debug overlay) ───────────────────
+    try:
+        H_inv      = np.linalg.inv(H_full)
+        tpl_corners = np.float32([[0, 0], [tw, 0], [tw, th], [0, th]]).reshape(-1, 1, 2)
+        stu_corners = cv2.perspectiveTransform(tpl_corners, H_inv).reshape(4, 2)
+        return warped, stu_corners
+    except Exception as exc:
+        log.warning("ORB: could not compute student corners: %s", exc)
+        return warped, None
+
+
 # ---------------------------------------------------------------------------
 # Template circle detection
 # ---------------------------------------------------------------------------
@@ -611,13 +801,13 @@ def _run_perspective_correction(
     img: np.ndarray, gray: np.ndarray
 ) -> tuple[np.ndarray, "np.ndarray | None", str]:
     """
-    Try the 3-stage perspective correction pipeline.
+    Try the 4-stage perspective correction pipeline.
 
     Returns:
         warped_color : BGR image aligned to TEMPLATE_DIMS
         corners      : (4, 2) float32 source corners in the ORIGINAL image space,
                        or None when resize_only was used
-        mode         : "markers" | "edge_detection" | "resize_only"
+        mode         : "markers" | "orb" | "edge_detection" | "resize_only"
     """
     # Stage 1: solid black corner markers
     try:
@@ -626,9 +816,19 @@ def _run_perspective_correction(
         log.info("Perspective: corner markers -> warpPerspective")
         return warped, corners, "markers"
     except RuntimeError as exc:
-        log.warning("Corner markers failed (%s) — trying edge detection", exc)
+        log.warning("Corner markers failed (%s) — trying ORB", exc)
 
-    # Stage 2: Canny paper-edge detection
+    # Stage 2: ORB feature matching against rendered PDF template
+    if _TEMPLATE_IMAGE is not None:
+        warped_orb, stu_corners = _warp_by_orb(img)
+        if warped_orb is not None:
+            log.info("Perspective: ORB feature matching")
+            return warped_orb, stu_corners, "orb"
+        log.warning("ORB matching failed — trying Canny edge detection")
+    else:
+        log.warning("No template image for ORB — trying Canny edge detection")
+
+    # Stage 3: Canny paper-edge detection
     corners = _find_page_corners_by_edges(gray)
     if corners is not None:
         warped = warp_to_template(img, corners)
@@ -636,7 +836,7 @@ def _run_perspective_correction(
         return warped, corners, "edge_detection"
     log.warning("Edge detection also failed — using resize fallback")
 
-    # Stage 3: simple resize
+    # Stage 4: simple resize
     return _warp_by_resize(img), None, "resize_only"
 
 
@@ -951,20 +1151,34 @@ def debug_visual():
         _, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 82])
         b64_proc = "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
 
-        # ── Annotate the ORIGINAL image with perspective corners ──────────────
+        # ── Perspective image: ORB match viz OR original with corner polygon ───
         b64_persp = None
-        if corners is not None:
-            orig_sc = min(1.0, MAX_PX / max(img.shape[1], img.shape[0]))
+
+        if mode == "orb" and _last_orb_viz is not None:
+            # Show ORB keypoint matches between student photo and template
+            orb_h, orb_w = _last_orb_viz.shape[:2]
+            orb_sc = min(1.0, MAX_PX / max(orb_w, orb_h))
+            vis_orb = cv2.resize(_last_orb_viz,
+                                 (int(orb_w * orb_sc), int(orb_h * orb_sc)),
+                                 interpolation=cv2.INTER_AREA)
+            cv2.putText(vis_orb, f"ORB matches | {mode}",
+                        (10, vis_orb.shape[0] - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2, cv2.LINE_AA)
+            _, buf2 = cv2.imencode(".jpg", vis_orb, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            b64_persp = "data:image/jpeg;base64," + base64.b64encode(buf2).decode("ascii")
+
+        elif corners is not None:
+            # Show original photo with blue polygon marking the detected paper boundary
+            orig_sc  = min(1.0, MAX_PX / max(img.shape[1], img.shape[0]))
             vis_orig = cv2.resize(img.copy(),
                                   (int(img.shape[1] * orig_sc), int(img.shape[0] * orig_sc)),
                                   interpolation=cv2.INTER_AREA)
             sc_corners = (corners * orig_sc).astype(np.int32)
 
-            # Blue polygon connecting the detected corners
             cv2.polylines(vis_orig, [sc_corners.reshape(-1, 1, 2)], True, (255, 80, 0), 2)
             for i, pt in enumerate(sc_corners):
-                cv2.circle(vis_orig, tuple(pt), 10,  (255, 80, 0), -1)
-                cv2.circle(vis_orig, tuple(pt), 12,  (255, 255, 255), 2)
+                cv2.circle(vis_orig, tuple(pt), 10, (255, 80, 0), -1)
+                cv2.circle(vis_orig, tuple(pt), 12, (255, 255, 255), 2)
                 label_corner = ["TL", "TR", "BR", "BL"][i]
                 cv2.putText(vis_orig, label_corner,
                             (int(pt[0]) + 14, int(pt[1]) + 6),
@@ -1136,6 +1350,10 @@ def get_sheet(exam_code: str):
     # Auto-load into memory so /procesar works immediately after /sheet
     if COORDS_SOURCE != "setup_template":
         _load_sheet_coords_file(per_exam)
+
+    # Render the template image for ORB alignment (overwrites any stale PNG)
+    _render_template_image(safe_code)
+
     return send_file(
         io.BytesIO(pdf_bytes),
         mimetype="application/pdf",

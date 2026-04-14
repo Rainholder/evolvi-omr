@@ -3,7 +3,7 @@ services:
     name: evolvi-omr
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: apt-get install -y poppler-utils && pip install -r requirements.txt
     startCommand: gunicorn app:app --workers 2 --timeout 120 --bind 0.0.0.0:$PORT
     envVars:
       - key: PYTHON_VERSION
