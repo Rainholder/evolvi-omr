@@ -173,22 +173,22 @@ INSTRUCTIONS = (
 # ---------------------------------------------------------------------------
 # Separator & RESPUESTAS section
 # ---------------------------------------------------------------------------
-Y_SEPARATOR       = 285  # horizontal separator line
-Y_RESP_MARKER_TOP = 285  # TL/TR respuestas markers (span 285–293 pt from top)
-Y_RESP_LABEL      = 295  # "RESPUESTAS" label baseline (11 pt bold; 10 pt below separator)
-Y_RESP_HDRS       = 305  # A / B / C column-header baseline
-Y_RESP_ROW0       = 315  # first question-row bubble centre
+Y_SEPARATOR       = 290  # horizontal separator line (must stay clear)
+Y_RESP_MARKER_TOP = 290  # TL/TR respuestas markers (span 290–298 pt from top)
+Y_RESP_LABEL      = 298  # "RESPUESTAS" label baseline — drawn at x=30 to clear TL marker
+Y_RESP_HDRS       = 310  # A / B / C column-header baseline
+Y_RESP_ROW0       = 320  # first question-row bubble centre
 
 N_COLS    = 6
 N_ROWS    = 15
 R_RESP    = 8     # pt radius (diameter 16 pt — as spec)
 OPT_STEP  = 22    # pt horizontal centre-to-centre A→B and B→C (as spec)
-QROW_STEP = 19    # pt vertical centre-to-centre between questions (as spec)
+QROW_STEP = 22    # pt vertical centre-to-centre between questions
 
-#   Last row centre   : Y_RESP_ROW0 + 14 × 19 = 581 pt from top
-#   Last bubble bottom: 581 + 8 = 589 pt from top
-Y_RESP_MARKER_BOT = 593  # BL/BR respuestas markers (span 593–601 pt from top)
-Y_FOOTER          = 772  # footer text baseline (PAGE_H − MARGIN = 792 − 20)
+#   Last row centre   : Y_RESP_ROW0 + 14 × 22 = 628 pt from top
+#   Last bubble bottom: 628 + 8 = 636 pt from top
+Y_RESP_MARKER_BOT = 644  # BL/BR respuestas markers (span 644–652 pt from top)
+Y_FOOTER          = 790  # footer text baseline (2 pt above page bottom)
 
 # Respuestas column geometry
 # Markers at x=20 (TL) right edge=28 pt, and x=584 (TR) left edge.
@@ -395,11 +395,13 @@ def build_sheet(exam_code: str) -> tuple[bytes, dict]:
     c.drawCentredString(cel_center_x, _y(Y_CEL_LABEL), "CELULAR")
 
     # ── Digit-input squares ──────────────────────────────────────────────────
+    # Left edge derived from the same bubble-centre formula so squares sit
+    # exactly above the corresponding bubble column.
     c.setStrokeColor(colors.black)
     c.setLineWidth(0.5)
     c.setFillColor(colors.white)
     for i in range(N_CEL_COLS):
-        sx = CEL_SQ_X0 + i * CEL_SQ_SIZE
+        sx = _cel_cx(i) - CEL_SQ_SIZE / 2.0
         c.rect(sx, _y(Y_CEL_SQ_BOT), CEL_SQ_SIZE, CEL_SQ_SIZE, fill=1, stroke=1)
 
     # ── Celular bubble grid ──────────────────────────────────────────────────
@@ -484,9 +486,10 @@ def build_sheet(exam_code: str) -> tuple[bytes, dict]:
         _marker(c, mx, my)
 
     # ── Section label ──────────────────────────────────────────────────────────
+    # Start at x=30 (LEFT_X + MARKER + 2) to clear the TL corner marker (x 20–28).
     c.setFont("Helvetica-Bold", 11)
     c.setFillColor(colors.black)
-    c.drawString(LEFT_X, _y(Y_RESP_LABEL), "RESPUESTAS")
+    c.drawString(LEFT_X + MARKER + 2, _y(Y_RESP_LABEL), "RESPUESTAS")
 
     # ── A / B / C column headers ───────────────────────────────────────────────
     opts = ["A", "B", "C"]
