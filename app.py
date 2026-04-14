@@ -78,6 +78,11 @@ _TEMPLATE_IMAGE:    np.ndarray | None = None  # rendered reference image for ORB
 _last_orb_viz:      np.ndarray | None = None  # last drawMatches output for /debug-visual
 _COORDS_EXAM_CODE:  str | None        = None  # exam_code from the last loaded coords file
 
+# 8-marker detection
+# {"celular_TL":[x,y], "celular_TR":…, …, "resp_BR":[x,y]} — pixel space (template dims)
+MARKER_TEMPLATE_POSITIONS: dict | None = None
+_last_marker_result:       dict | None = None  # last find_all_markers() output for /debug-visual
+
 # Standard Letter page at 300 DPI — matches generate_sheet coordinate space
 _LETTER_W_PX = 2550
 _LETTER_H_PX = 3300
@@ -150,6 +155,7 @@ def _load_sheet_coords_file(path: str) -> bool:
     calling _render_template_image(_COORDS_EXAM_CODE) when appropriate.
     """
     global TEMPLATE_CIRCLES, TEMPLATE_DIMS, COORDS_SOURCE, _COORDS_EXAM_CODE
+    global MARKER_TEMPLATE_POSITIONS
     if not os.path.exists(path):
         return False
     try:
@@ -163,6 +169,14 @@ def _load_sheet_coords_file(path: str) -> bool:
         TEMPLATE_DIMS     = (_LETTER_W_PX, _LETTER_H_PX)
         COORDS_SOURCE     = "sheet_coords"
         _COORDS_EXAM_CODE = data.get("exam_code")   # may be None for bare-format files
+        # Load 8-marker template positions if present (added by compute_sheet_coords)
+        raw_markers = coords.get("markers")
+        if raw_markers:
+            MARKER_TEMPLATE_POSITIONS = {k: [int(v[0]), int(v[1])] for k, v in raw_markers.items()}
+            log.info("Marker template positions loaded: %d markers", len(MARKER_TEMPLATE_POSITIONS))
+        else:
+            MARKER_TEMPLATE_POSITIONS = None
+            log.info("No markers section in coords file — 8-marker detection unavailable")
         r_sample = list(circles.values())[0]["A"][2]
         log.info(
             "Sheet coords loaded from %s — %d questions, r=%d px, dims=%s, exam_code=%s",
@@ -410,6 +424,140 @@ def find_corner_markers(gray: np.ndarray) -> np.ndarray:
         f"Last attempt: {len(last)} candidate(s). "
         "Ensure the 4 black corner squares are fully visible and unobstructed."
     )
+
+
+# ---------------------------------------------------------------------------
+# 8-marker detection (celular zone × 4 + respuestas zone × 4)
+# ---------------------------------------------------------------------------
+_MARKER_NAMES = [
+    "celular_TL", "celular_TR", "celular_BL", "celular_BR",
+    "resp_TL",    "resp_TR",    "resp_BL",    "resp_BR",
+]
+
+
+def find_all_markers(gray: np.ndarray) -> "dict | None":
+    """
+    Locate the 8 solid black square markers (4 in the celular zone + 4 in
+    the respuestas zone) and match them to their known template positions.
+
+    Strategy:
+      1. Run _filter_marker_candidates at increasing thresholds until ≥ 4 hits.
+      2. Normalise both detected (cx/w, cy/h) and template (tx/tw, ty/th) to [0,1].
+      3. Greedy nearest-neighbour from each template marker to the closest unused
+         candidate — assigns at most one candidate per template marker.
+      4. Discard assignments with normalised distance > 0.20 (bad detections).
+      5. Return None if < 4 good assignments remain.
+
+    Returns dict:
+        {
+          "src_pts":        (N,2) float32 — detected positions in image space
+          "dst_pts":        (N,2) float32 — matched template positions (px)
+          "n_found":        N  (≥4 guaranteed when not None)
+          "named":          [(cx,cy, name), …]  — for debug overlay
+          "candidates_all": [(cx,cy), …]        — all raw candidates
+        }
+    """
+    if MARKER_TEMPLATE_POSITIONS is None:
+        raise RuntimeError("MARKER_TEMPLATE_POSITIONS not loaded — call GET /sheet first")
+
+    h, w = gray.shape
+    tw, th = TEMPLATE_DIMS
+
+    # ── Collect candidates ────────────────────────────────────────────────────
+    candidates: list = []
+    for thresh_val in _MARKER_THRESHOLDS:
+        cands, total = _filter_marker_candidates(gray, thresh_val)
+        log.info("8-marker thresh=%d: %d raw → %d candidates", thresh_val, total, len(cands))
+        if len(cands) >= 4:
+            candidates = cands
+            break
+
+    if len(candidates) < 4:
+        log.warning("find_all_markers: only %d candidates (need ≥ 4)", len(candidates))
+        return None
+
+    # ── Normalised positions ──────────────────────────────────────────────────
+    norm_cands = [(cx / w, cy / h) for cx, cy in candidates]
+    tpl_norm   = {
+        name: (MARKER_TEMPLATE_POSITIONS[name][0] / tw,
+               MARKER_TEMPLATE_POSITIONS[name][1] / th)
+        for name in _MARKER_NAMES
+    }
+
+    # ── Greedy match: template marker → nearest unused candidate ─────────────
+    remaining = list(range(len(candidates)))  # indices into candidates[]
+    matched: list = []   # (cand_idx, marker_name, dist)
+
+    for name in _MARKER_NAMES:
+        if not remaining:
+            break
+        tx, ty = tpl_norm[name]
+        best_i = min(
+            remaining,
+            key=lambda i: (norm_cands[i][0] - tx) ** 2 + (norm_cands[i][1] - ty) ** 2,
+        )
+        nx, ny = norm_cands[best_i]
+        dist   = ((nx - tx) ** 2 + (ny - ty) ** 2) ** 0.5
+        if dist < 0.20:
+            matched.append((best_i, name, dist))
+            remaining.remove(best_i)
+
+    log.info(
+        "find_all_markers: %d/%d candidates matched (dist<0.20), names=%s",
+        len(matched), len(candidates),
+        [name for _, name, _ in matched],
+    )
+
+    if len(matched) < 4:
+        log.warning("find_all_markers: only %d good matches (need ≥ 4)", len(matched))
+        return None
+
+    src_pts = np.float32([candidates[i]                            for i, _, _ in matched])
+    dst_pts = np.float32([MARKER_TEMPLATE_POSITIONS[name]          for _, name, _ in matched])
+    named   = [(candidates[i][0], candidates[i][1], name)          for i, name, _ in matched]
+
+    return {
+        "src_pts":        src_pts,
+        "dst_pts":        dst_pts,
+        "n_found":        len(matched),
+        "named":          named,
+        "candidates_all": candidates,
+    }
+
+
+def _warp_by_markers(img: np.ndarray, mr: dict) -> tuple[np.ndarray, "np.ndarray | None"]:
+    """
+    Compute a perspective homography from N marker correspondences (N ≥ 4) and
+    warp the image to TEMPLATE_DIMS.
+
+    Uses cv2.findHomography (RANSAC) instead of getPerspectiveTransform so that
+    all N points vote and outlier detections are suppressed.
+
+    Returns (warped_color, page_corners_in_original_image_space).
+    page_corners is None if the inverse homography cannot be computed.
+    """
+    tw, th = TEMPLATE_DIMS
+    src    = mr["src_pts"].reshape(-1, 1, 2)
+    dst    = mr["dst_pts"].reshape(-1, 1, 2)
+
+    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+    if H is None:
+        raise RuntimeError("findHomography returned None for marker correspondences")
+
+    inliers = int(mask.sum()) if mask is not None else mr["n_found"]
+    log.info("_warp_by_markers: H computed from %d pts, %d inliers", mr["n_found"], inliers)
+
+    warped = cv2.warpPerspective(img, H, (tw, th))
+
+    try:
+        H_inv       = np.linalg.inv(H)
+        page_pts    = np.float32([[0, 0], [tw, 0], [tw, th], [0, th]]).reshape(-1, 1, 2)
+        src_corners = cv2.perspectiveTransform(page_pts, H_inv).reshape(4, 2)
+    except Exception as exc:
+        log.debug("Could not invert marker homography: %s", exc)
+        src_corners = None
+
+    return warped, src_corners
 
 
 # ---------------------------------------------------------------------------
@@ -834,16 +982,33 @@ def _run_perspective_correction(
         warped_color : BGR image aligned to TEMPLATE_DIMS
         corners      : (4, 2) float32 source corners in the ORIGINAL image space,
                        or None when resize_only was used
-        mode         : "markers" | "orb" | "edge_detection" | "resize_only"
+        mode         : "markers_N" | "orb" | "edge_detection" | "resize_only"
+                       (N = number of markers used, 4–8)
     """
-    # Stage 1: solid black corner markers
-    try:
-        corners = find_corner_markers(gray)
-        warped  = warp_to_template(img, corners)
-        log.info("Perspective: corner markers -> warpPerspective")
-        return warped, corners, "markers"
-    except RuntimeError as exc:
-        log.warning("Corner markers failed (%s) — trying ORB", exc)
+    global _last_marker_result
+    _last_marker_result = None
+
+    # Stage 1: 8-marker findHomography (4–8 markers, RANSAC robust)
+    if MARKER_TEMPLATE_POSITIONS is not None:
+        try:
+            mr = find_all_markers(gray)
+            _last_marker_result = mr
+            if mr is not None:
+                warped, corners = _warp_by_markers(img, mr)
+                n = mr["n_found"]
+                log.info("Perspective: %d-marker findHomography", n)
+                return warped, corners, f"markers_{n}"
+        except Exception as exc:
+            log.warning("find_all_markers failed (%s) — trying ORB", exc)
+    else:
+        # Legacy: no template marker positions → try old 4-corner method
+        try:
+            corners = find_corner_markers(gray)
+            warped  = warp_to_template(img, corners)
+            log.info("Perspective: legacy 4-corner markers -> warpPerspective")
+            return warped, corners, "markers_4"
+        except RuntimeError as exc:
+            log.warning("Legacy corner markers failed (%s) — trying ORB", exc)
 
     # Stage 2: ORB feature matching against rendered PDF template
     if _TEMPLATE_IMAGE is not None:
@@ -1145,19 +1310,41 @@ def debug_visual():
         # ── Annotate the PROCESSED (warped) image ────────────────────────────
         vis = cv2.resize(warped_color, (vis_w, vis_h), interpolation=cv2.INTER_AREA)
 
-        # Blue filled circles at the 4 warp-anchor corners of the output canvas
-        corner_r = max(r_min, int(18 * sc))
-        for cx, cy in [
-            (corner_r,        corner_r),
-            (vis_w - corner_r, corner_r),
-            (vis_w - corner_r, vis_h - corner_r),
-            (corner_r,        vis_h - corner_r),
-        ]:
-            cv2.circle(vis, (cx, cy), corner_r,     (255, 80, 0), -1)
-            cv2.circle(vis, (cx, cy), corner_r + 2, (255, 255, 255), 2)
+        # ── Draw template marker positions on the warped image ────────────────
+        # celular markers = blue  |  resp markers = green
+        # This makes it easy to verify that the perspective warp is aligned.
+        mk_half = max(r_min, int(14 * sc))   # half-side of the drawn square
+        if MARKER_TEMPLATE_POSITIONS:
+            detected_names = (
+                {nm for _, nm, _ in _last_marker_result["named"]}
+                if _last_marker_result else set()
+            )
+            for mk_name, (mx, my) in MARKER_TEMPLATE_POSITIONS.items():
+                dx, dy   = int(mx * sc), int(my * sc)
+                detected = mk_name in detected_names
+                if mk_name.startswith("celular"):
+                    color = (255, 100, 0)    # blue-orange: celular
+                else:
+                    color = (30, 200, 30)    # green: respuestas
+                if not detected:
+                    color = (30, 30, 220)    # red: not found in photo
+                cv2.rectangle(vis, (dx - mk_half, dy - mk_half),
+                              (dx + mk_half, dy + mk_half), color, -1)
+                cv2.rectangle(vis, (dx - mk_half - 1, dy - mk_half - 1),
+                              (dx + mk_half + 1, dy + mk_half + 1), (255, 255, 255), 1)
+        else:
+            # Fallback: 4 corner marks
+            corner_r = max(r_min, int(18 * sc))
+            for cx, cy in [
+                (corner_r,         corner_r),
+                (vis_w - corner_r, corner_r),
+                (vis_w - corner_r, vis_h - corner_r),
+                (corner_r,         vis_h - corner_r),
+            ]:
+                cv2.circle(vis, (cx, cy), corner_r,     (255, 80, 0), -1)
+                cv2.circle(vis, (cx, cy), corner_r + 2, (255, 255, 255), 2)
 
-        # Batch-project all bubble positions at the output scale
-        # (direct scale: warped coords → display coords)
+        # ── Bubble positions ──────────────────────────────────────────────────
         for q_str, opts in TEMPLATE_CIRCLES.items():
             answer = respuestas.get(q_str)
             for opt, coords in opts.items():
@@ -1171,18 +1358,70 @@ def debug_visual():
                     cv2.circle(vis, (cx, cy), r, (30, 30, 220), 1)        # red hollow
 
         # Mode + stats label
-        label = f"{mode} | {total_det}/{total_preguntas} detectados"
+        n_mk = _last_marker_result["n_found"] if _last_marker_result else 0
+        label = f"{mode} | {total_det}/{total_preguntas} bubbles | {n_mk}/8 markers"
         cv2.putText(vis, label, (10, vis_h - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 220, 255), 2, cv2.LINE_AA)
 
         _, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 82])
         b64_proc = "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
 
-        # ── Perspective image: ORB match viz OR original with corner polygon ───
-        b64_persp = None
+        # ── Perspective image (segunda imagen) ───────────────────────────────
+        # Priority: markers → draw detected markers on original photo
+        #           orb     → draw ORB keypoint matches
+        #           edge    → draw page polygon
+        b64_persp    = None
+        markers_info: dict = {}   # returned in JSON for clients that want raw data
 
-        if mode == "orb" and _last_orb_viz is not None:
-            # Show ORB keypoint matches between student photo and template
+        if mode.startswith("markers_") and _last_marker_result is not None:
+            orig_sc  = min(1.0, MAX_PX / max(img.shape[1], img.shape[0]))
+            vis_orig = cv2.resize(img.copy(),
+                                  (int(img.shape[1] * orig_sc), int(img.shape[0] * orig_sc)),
+                                  interpolation=cv2.INTER_AREA)
+
+            # Page boundary polygon (cyan)
+            if corners is not None:
+                sc_corners = (corners * orig_sc).astype(np.int32)
+                cv2.polylines(vis_orig, [sc_corners.reshape(-1, 1, 2)], True, (0, 220, 255), 2)
+
+            # Draw each detected marker — celular = blue, resp = green
+            for mk_cx, mk_cy, mk_name in _last_marker_result["named"]:
+                color = (255, 100, 0) if mk_name.startswith("celular") else (30, 200, 30)
+                pt    = (int(mk_cx * orig_sc), int(mk_cy * orig_sc))
+                cv2.circle(vis_orig, pt, 12, color, -1)
+                cv2.circle(vis_orig, pt, 14, (255, 255, 255), 2)
+                short = mk_name.replace("celular_", "C-").replace("resp_", "R-")
+                cv2.putText(vis_orig, short,
+                            (pt[0] + 10, pt[1] + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                            (255, 255, 255), 3, cv2.LINE_AA)
+                cv2.putText(vis_orig, short,
+                            (pt[0] + 10, pt[1] + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                            color, 1, cv2.LINE_AA)
+                markers_info[mk_name] = [int(mk_cx), int(mk_cy)]
+
+            # Also draw undetected markers as red circles at candidate positions
+            # (we know ALL candidates, even unmatched ones)
+            detected_names = {nm for _, nm, _ in _last_marker_result["named"]}
+            for cand_cx, cand_cy in _last_marker_result["candidates_all"]:
+                # Check if this candidate was matched
+                matched = any(
+                    abs(mk_cx - cand_cx) < 2 and abs(mk_cy - cand_cy) < 2
+                    for mk_cx, mk_cy, _ in _last_marker_result["named"]
+                )
+                if not matched:
+                    pt = (int(cand_cx * orig_sc), int(cand_cy * orig_sc))
+                    cv2.circle(vis_orig, pt, 8, (30, 30, 220), -1)   # red — unmatched candidate
+
+            cv2.putText(vis_orig, f"{mode} | {n_mk}/8 markers detected",
+                        (10, vis_orig.shape[0] - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 220, 255), 2, cv2.LINE_AA)
+
+            _, buf2 = cv2.imencode(".jpg", vis_orig, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            b64_persp = "data:image/jpeg;base64," + base64.b64encode(buf2).decode("ascii")
+
+        elif mode == "orb" and _last_orb_viz is not None:
             orb_h, orb_w = _last_orb_viz.shape[:2]
             orb_sc = min(1.0, MAX_PX / max(orb_w, orb_h))
             vis_orb = cv2.resize(_last_orb_viz,
@@ -1190,44 +1429,41 @@ def debug_visual():
                                  interpolation=cv2.INTER_AREA)
             cv2.putText(vis_orb, f"ORB matches | {mode}",
                         (10, vis_orb.shape[0] - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 220, 255), 2, cv2.LINE_AA)
             _, buf2 = cv2.imencode(".jpg", vis_orb, [cv2.IMWRITE_JPEG_QUALITY, 82])
             b64_persp = "data:image/jpeg;base64," + base64.b64encode(buf2).decode("ascii")
 
         elif corners is not None:
-            # Show original photo with blue polygon marking the detected paper boundary
             orig_sc  = min(1.0, MAX_PX / max(img.shape[1], img.shape[0]))
             vis_orig = cv2.resize(img.copy(),
                                   (int(img.shape[1] * orig_sc), int(img.shape[0] * orig_sc)),
                                   interpolation=cv2.INTER_AREA)
             sc_corners = (corners * orig_sc).astype(np.int32)
-
             cv2.polylines(vis_orig, [sc_corners.reshape(-1, 1, 2)], True, (255, 80, 0), 2)
             for i, pt in enumerate(sc_corners):
                 cv2.circle(vis_orig, tuple(pt), 10, (255, 80, 0), -1)
                 cv2.circle(vis_orig, tuple(pt), 12, (255, 255, 255), 2)
-                label_corner = ["TL", "TR", "BR", "BL"][i]
-                cv2.putText(vis_orig, label_corner,
-                            (int(pt[0]) + 14, int(pt[1]) + 6),
+                lbl = ["TL", "TR", "BR", "BL"][i]
+                cv2.putText(vis_orig, lbl, (int(pt[0]) + 14, int(pt[1]) + 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 3, cv2.LINE_AA)
-                cv2.putText(vis_orig, label_corner,
-                            (int(pt[0]) + 14, int(pt[1]) + 6),
+                cv2.putText(vis_orig, lbl, (int(pt[0]) + 14, int(pt[1]) + 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 80, 0), 1, cv2.LINE_AA)
-
-            cv2.putText(vis_orig, mode,
-                        (10, vis_orig.shape[0] - 12),
+            cv2.putText(vis_orig, mode, (10, vis_orig.shape[0] - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2, cv2.LINE_AA)
-
             _, buf2 = cv2.imencode(".jpg", vis_orig, [cv2.IMWRITE_JPEG_QUALITY, 82])
             b64_persp = "data:image/jpeg;base64," + base64.b64encode(buf2).decode("ascii")
 
         result = {
             "ok":                      True,
             "perspective_mode":        mode,
+            "markers_detected":        n_mk,
+            "markers_in_template":     len(MARKER_TEMPLATE_POSITIONS) if MARKER_TEMPLATE_POSITIONS else 0,
             "total_detectadas":        total_det,
             "confianza":               confianza,
             "imagen_procesada_base64": b64_proc,
         }
+        if markers_info:
+            result["markers_positions"] = markers_info
         if b64_persp:
             result["imagen_perspectiva_base64"] = b64_persp
 
@@ -1456,6 +1692,7 @@ def health():
         "source":                COORDS_SOURCE,
         "exam_code":             _COORDS_EXAM_CODE,
         "questions_ready":       len(TEMPLATE_CIRCLES) if TEMPLATE_CIRCLES else 0,
+        "markers_in_template":   len(MARKER_TEMPLATE_POSITIONS) if MARKER_TEMPLATE_POSITIONS else 0,
         "template_image_loaded": _TEMPLATE_IMAGE is not None,
         "perspective_mode":      LAST_PERSPECTIVE_MODE,
     }), 200

@@ -146,6 +146,10 @@ Y_CEL_MARKER_BOT = 260   # BL/BR celular markers (span 260–268 pt from top)
 CEL_MARKER_L = RIGHT_X                         # = 345 pt
 CEL_MARKER_R = RIGHT_X_END - MARKER            # = 584 pt
 
+# Respuestas zone marker x positions (full page width)
+RESP_MARKER_L = LEFT_X                         # = 20 pt
+RESP_MARKER_R = RIGHT_X_END - MARKER           # = 584 pt
+
 # ---------------------------------------------------------------------------
 # LEFT COLUMN vertical positions
 # ---------------------------------------------------------------------------
@@ -281,7 +285,21 @@ def compute_sheet_coords() -> dict:
             row_map[str(dig)] = _pt2px(cx, _cel_cy(dig))
         celular[str(pos)] = row_map
 
-    return {"celular": celular, "respuestas": respuestas}
+    # ── Marker centres (pixel space, 300 DPI) ────────────────────────────────
+    # Each marker is an MARKER×MARKER pt square; centre = corner + MARKER/2.
+    half_m = MARKER / 2.0
+    markers = {
+        "celular_TL": _pt2px(CEL_MARKER_L  + half_m, Y_CEL_MARKER_TOP  + half_m),
+        "celular_TR": _pt2px(CEL_MARKER_R  + half_m, Y_CEL_MARKER_TOP  + half_m),
+        "celular_BL": _pt2px(CEL_MARKER_L  + half_m, Y_CEL_MARKER_BOT  + half_m),
+        "celular_BR": _pt2px(CEL_MARKER_R  + half_m, Y_CEL_MARKER_BOT  + half_m),
+        "resp_TL":    _pt2px(RESP_MARKER_L + half_m, Y_RESP_MARKER_TOP + half_m),
+        "resp_TR":    _pt2px(RESP_MARKER_R + half_m, Y_RESP_MARKER_TOP + half_m),
+        "resp_BL":    _pt2px(RESP_MARKER_L + half_m, Y_RESP_MARKER_BOT + half_m),
+        "resp_BR":    _pt2px(RESP_MARKER_R + half_m, Y_RESP_MARKER_BOT + half_m),
+    }
+
+    return {"celular": celular, "respuestas": respuestas, "markers": markers}
 
 
 # ---------------------------------------------------------------------------
@@ -475,13 +493,11 @@ def build_sheet(exam_code: str) -> tuple[bytes, dict]:
     # =========================================================================
 
     # ── Respuestas zone markers (TL / TR / BL / BR) ───────────────────────────
-    resp_marker_l = LEFT_X               # = 20 pt
-    resp_marker_r = RIGHT_X_END - MARKER # = 584 pt
     for mx, my in [
-        (resp_marker_l, Y_RESP_MARKER_TOP),   # TL
-        (resp_marker_r, Y_RESP_MARKER_TOP),   # TR
-        (resp_marker_l, Y_RESP_MARKER_BOT),   # BL
-        (resp_marker_r, Y_RESP_MARKER_BOT),   # BR
+        (RESP_MARKER_L, Y_RESP_MARKER_TOP),   # TL
+        (RESP_MARKER_R, Y_RESP_MARKER_TOP),   # TR
+        (RESP_MARKER_L, Y_RESP_MARKER_BOT),   # BL
+        (RESP_MARKER_R, Y_RESP_MARKER_BOT),   # BR
     ]:
         _marker(c, mx, my)
 
