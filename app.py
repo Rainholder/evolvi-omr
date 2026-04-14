@@ -728,7 +728,8 @@ def get_sheet(exam_code: str):
     try:
         with open(coords_path, "w") as f:
             json.dump({"exam_code": exam_code.upper(), "coords": sheet_coords}, f)
-        log.info("Saved %d question coords to %s", len(sheet_coords), coords_path)
+        log.info("Saved coords (%d resp + %d cel) to %s",
+                 len(sheet_coords["respuestas"]), len(sheet_coords["celular"]), coords_path)
     except Exception as exc:
         log.warning("Could not save sheet_coords.json: %s", exc)
 
@@ -755,11 +756,18 @@ def get_coords(exam_code: str):
           "exam_code": "EV-ATR-JUN26",
           "title": "ÁREAS TRANSVERSALES",
           "total_questions": 90,
-          "bubble_radius_px": 42,
+          "bubble_radius_px": 33,
           "coords": {
-            "1":  {"A": [242, 1550], "B": [363, 1550], "C": [484, 1550]},
-            ...
-            "90": {"A": [...], "B": [...], "C": [...]}
+            "celular": {
+              "0": {"0": [1538, 284], ..., "9": [1538, 1033]},
+              ...
+              "9": {...}
+            },
+            "respuestas": {
+              "1":  {"A": [238, 1313], "B": [330, 1313], "C": [421, 1313]},
+              ...
+              "90": {...}
+            }
           }
         }
     """
@@ -780,7 +788,7 @@ def get_coords(exam_code: str):
         "ok":             True,
         "exam_code":      info["code"],
         "title":          info["title"],
-        "total_questions": len(coords),
+        "total_questions": len(coords["respuestas"]),
         "bubble_radius_px": r_px,
         "dpi":            300,
         "image_size_px":  [2550, 3300],

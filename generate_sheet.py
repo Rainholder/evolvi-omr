@@ -4,25 +4,38 @@ generate_sheet.py — EVOLVI OMR answer-sheet PDF generator.
 Entry point:
     pdf_bytes, sheet_coords = build_sheet("EV-ATR-JUN26")
 
-sheet_coords (for OMR processing):
-    {"1": {"A": [cx_px, cy_px], "B": [...], "C": [...]}, ..., "90": {...}}
+sheet_coords:
+    {
+      "celular": {
+        "0": {"0": [x,y], "1": [x,y], …, "9": [x,y]},   # digit-position → digit-value → [cx_px, cy_px]
+        …
+        "9": {…}
+      },
+      "respuestas": {
+        "1":  {"A": [cx_px, cy_px], "B": [cx_px, cy_px], "C": [cx_px, cy_px]},
+        …
+        "90": {…}
+      }
+    }
 
-    Pixel coordinates at 300 DPI with top-left origin.
-    Matches a 2550 × 3300 px image of the printed Letter page.
+    Pixel coordinates at 300 DPI, top-left origin → matches a 2550×3300 px image.
 
-Layout (Letter 612 × 792 pt):
-    ┌────────────────────────────────┐
-    │ ▪  TL marker          TR ▪    │  ← page-corner markers (OMR ref)
-    │    Header / title / code       │
-    │    NOMBRE / APELLIDO fields    │
-    │  ▪ ┌──────────────────┐ ▪     │  ← celular-zone markers
-    │    │  CELULAR grid    │       │
-    │  ▪ └──────────────────┘ ▪     │
-    │    RESPUESTAS  (6 cols × 15)  │
-    │    …                          │
-    │         EVOLVI                │
-    │ ▪  BL marker          BR ▪    │
-    └────────────────────────────────┘
+Page layout (Letter 612×792 pt, 20 pt margins all sides):
+
+    ┌─────────────────────────────────────────┐
+    │ LEFT COL (20–330)  │ RIGHT COL (345–592)│
+    │  Exam title 14pt   │  ▪ CELULAR ▪       │
+    │  Exam code 11pt    │  [ ][ ]…[ ] ←sq   │
+    │  NOMBRE rect       │  ○ ○ ○ ○ ○ …      │
+    │  APELLIDOS rect    │  ○ ○ ○ ○ ○ …      │
+    │  INSTRUCCIONES     │  (10×10 grid)      │
+    │                    │  ▪           ▪     │
+    ├────── separator line ───────────────────┤
+    │  ▪ RESPUESTAS               ▪           │
+    │  6 cols × 15 rows of A B C bubbles      │
+    │  ▪                          ▪           │
+    │  EV-ATR-JUN26              EVOLVI       │
+    └─────────────────────────────────────────┘
 """
 
 import io
@@ -60,21 +73,18 @@ EXAM_TITLES: dict[str, str] = {
 
 def parse_exam_code(raw: str) -> dict:
     """
-    Decompose an exam code into its parts.
+    Decompose an exam code into its components.
 
     "EV-ATR-JUN26" → {code, area: "ATR", title: "ÁREAS TRANSVERSALES", period: "JUN26"}
-    "BIO"          → {code, area: "BIO", title: "BIOLOGÍA", period: ""}
     """
     code  = raw.strip().upper()
     parts = code.split("-")
-
     if len(parts) >= 3:
         area, period = parts[1], parts[2]
     elif len(parts) == 2:
         area, period = parts[1], ""
     else:
         area, period = parts[0], ""
-
     return {
         "code":   code,
         "area":   area,
@@ -84,55 +94,115 @@ def parse_exam_code(raw: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Page constants
+# Page geometry
 # ---------------------------------------------------------------------------
-PAGE_W, PAGE_H = LETTER     # 612 × 792 pt  (Letter)
+PAGE_W, PAGE_H = LETTER      # 612 × 792 pt
+MARGIN = 20                  # pt, all four sides
 
-# 300 DPI export → Letter = 2550 × 3300 px
+# Export resolution
 DPI   = 300
-PT_PX = DPI / 72.0          # ≈ 4.1667 px/pt
+PT_PX = DPI / 72.0           # ≈ 4.1667 px / pt   →   Letter = 2550 × 3300 px
 
-# ── Corner / zone markers ────────────────────────────────────────────────────
-MARKER    = 23   # pt  (≈ 8.1 mm — spec calls for 8 mm)
-MARK_EDGE = 12   # pt from page edge to near side of page-corner markers
+# ---------------------------------------------------------------------------
+# Corner / zone markers — solid black 8 × 8 pt squares
+# ---------------------------------------------------------------------------
+MARKER = 8      # pt side length (≈ 2.8 mm; spec says "8x8pt")
 
-# ── Respuestas bubble geometry ────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Two-column split (top section)
+# ---------------------------------------------------------------------------
+LEFT_X     = 20    # left  col: x 20–330  (width 310 pt)
+LEFT_X_END = 330
+RIGHT_X    = 345   # right col: x 345–592 (width 247 pt)
+RIGHT_X_END = 592
+
+# ---------------------------------------------------------------------------
+# CELULAR layout (right column)
+# ---------------------------------------------------------------------------
+N_CEL_COLS  = 10       # digit positions
+N_CEL_ROWS  = 10       # digit values 0–9
+
+CEL_SQ_SIZE = 22       # pt — each digit-input square (width = height)
+# 10 squares × 22 pt = 220 pt, centred in 247 pt right column
+_CEL_SQ_OFFSET = (RIGHT_X_END - RIGHT_X - N_CEL_COLS * CEL_SQ_SIZE) // 2  # = 13 pt
+CEL_SQ_X0 = RIGHT_X + _CEL_SQ_OFFSET          # = 358 pt — left edge of first square
+
+R_CEL        = 8    # pt radius (diameter 16 pt — as spec)
+CEL_CX0      = CEL_SQ_X0 + CEL_SQ_SIZE // 2   # = 369 pt — centre of first bubble column
+CEL_COL_STEP = CEL_SQ_SIZE                     # = 22 pt — horizontal centre-to-centre
+CEL_ROW_STEP = 20                              # pt — vertical centre-to-centre
+
+# Vertical positions (y measured from TOP of page)
+Y_CEL_MARKER_TOP = MARGIN                      # = 20 pt — TL/TR celular markers
+Y_CEL_LABEL      = 33    # "CELULAR" text baseline
+Y_CEL_SQ_TOP     = 38    # digit-input squares: top edge
+Y_CEL_SQ_BOT     = Y_CEL_SQ_TOP + CEL_SQ_SIZE  # = 60 pt
+Y_CEL_ROW0       = 68    # first bubble-row centre (digit 0)
+#   Last row centre   : Y_CEL_ROW0 + 9×20 = 248 pt
+#   Last bubble bottom: 248 + 8    = 256 pt
+Y_CEL_MARKER_BOT = 260   # BL/BR celular markers (span 260–268 pt from top)
+
+# Celular zone marker x positions (at the outer edges of the right column)
+CEL_MARKER_L = RIGHT_X                         # = 345 pt
+CEL_MARKER_R = RIGHT_X_END - MARKER            # = 584 pt
+
+# ---------------------------------------------------------------------------
+# LEFT COLUMN vertical positions
+# ---------------------------------------------------------------------------
+Y_TITLE     = 34    # exam title baseline (14 pt bold)
+Y_CODE      = 51    # exam code baseline (11 pt)
+Y_NOMBRE_LBL = 65   # "NOMBRE(S):" label baseline (8 pt bold)
+Y_NOMBRE_TOP = 68   # NOMBRE rect top edge
+Y_NOMBRE_BOT = 96   # = 68 + 28 pt
+Y_APELL_LBL  = 108  # "APELLIDO(S):" label baseline
+Y_APELL_TOP  = 111  # APELLIDOS rect top edge
+Y_APELL_BOT  = 139  # = 111 + 28 pt
+Y_INST_LBL   = 153  # "INSTRUCCIONES:" label baseline
+Y_INST_TEXT  = 163  # first instruction text-line baseline
+
+INSTRUCTIONS = (
+    "Rellena solamente un alvéolo por respuesta, asegúrate que el alvéolo "
+    "está completamente lleno, si tuviste algún error y cambiaste de respuesta "
+    "asegúrate de borrar muy bien el alvéolo, esto puede afectar tu resultado "
+    "final. Escribe el celular que tengas registrado en tu plataforma Evolvi y "
+    "asegúrate que los alvéolos estén correctos, debes tener un alvéolo por "
+    "columna y tiene que coincidir con el número que hayas escrito en la parte "
+    "superior de la columna."
+)
+
+# ---------------------------------------------------------------------------
+# Separator & RESPUESTAS section
+# ---------------------------------------------------------------------------
+Y_SEPARATOR      = 272   # horizontal separator line
+Y_RESP_MARKER_TOP = 276  # TL/TR respuestas markers (span 276–284 pt from top)
+Y_RESP_LABEL     = 292   # "RESPUESTAS" label baseline (11 pt bold)
+Y_RESP_HDRS      = 305   # A / B / C column-header baseline
+Y_RESP_ROW0      = 315   # first question-row bubble centre
+
 N_COLS    = 6
 N_ROWS    = 15
-RESP_ML   = 36   # pt left margin for the answer grid
-QCOL_W    = 90   # pt per question column  (6 × 90 = 540 = 612 − 72 exactly)
-R_RESP    = 10   # pt bubble radius  (diameter 20 pt ≈ 7 mm)
-OPT_STEP  = 29   # pt horizontal center-to-center A→B and B→C  (≈ 10.2 mm)
-QROW_STEP = 24   # pt vertical center-to-center between questions  (≈ 8.5 mm)
-#   NUM_W = space for question-number label = QCOL_W − 2×OPT_STEP − 2×R_RESP
-NUM_W     = QCOL_W - 2 * OPT_STEP - 2 * R_RESP   # = 90 − 58 − 20 = 12 pt
+R_RESP    = 8     # pt radius (diameter 16 pt — as spec)
+OPT_STEP  = 22    # pt horizontal centre-to-centre A→B and B→C (as spec)
+QROW_STEP = 19    # pt vertical centre-to-centre between questions (as spec)
 
-# ── Celular (phone-number) bubble geometry ────────────────────────────────────
-N_CEL_COLS   = 10    # digit positions (0–9)
-N_CEL_ROWS   = 10    # digit values (0–9)
-R_CEL        = 5     # pt bubble radius  (diameter 10 pt ≈ 3.5 mm)
-CEL_COL_STEP = 20    # pt horizontal center-to-center
-CEL_ROW_STEP = 15    # pt vertical center-to-center
-#   Centre first column horizontally on the page
-CEL_CX0 = (PAGE_W - (N_CEL_COLS - 1) * CEL_COL_STEP) / 2   # = 216 pt
+#   Last row centre   : Y_RESP_ROW0 + 14 × 19 = 581 pt from top
+#   Last bubble bottom: 581 + 8 = 589 pt from top
+Y_RESP_MARKER_BOT = 593  # BL/BR respuestas markers (span 593–601 pt from top)
+Y_FOOTER          = 610  # footer text baseline
 
-# ── Vertical layout  (all values: pt measured from TOP of page) ───────────────
-# Page-corner markers occupy 12–35 pt from top.
-Y_HEADER    = 40     # "EXÁMENES…" baseline
-Y_TITLE     = 57     # exam title baseline
-Y_CODE      = 72     # exam code baseline
-Y_NAME      = 88     # NOMBRE(S) field box top
-Y_APELL     = 110    # APELLIDO(S) field box top   (bottom at 124 pt from top)
-Y_CEL_LBL   = 132    # "CELULAR" section label baseline
-Y_CEL_HDR   = 148    # digit-position header row baseline
-Y_CEL_ROW0  = 162    # first celular bubble-row centre  (digit 0)
-#   Celular grid bottom edge = 162 + 9×15 + 5 = 302 pt from top
-#   Celular zone markers: top=306, bottom=329 pt from top
-Y_RESP_LBL  = 340    # "RESPUESTAS" section label baseline  (11 pt gap)
-Y_RESP_HDR  = 356    # A / B / C column-header baseline
-Y_RESP_ROW0 = 372    # first question-row bubble centres   (Q1, Q16, Q31 …)
-#   Last row centre  = 372 + 14×24 = 708 pt from top
-#   Last bubble bottom = 718 pt → footer at 748 pt → markers at 757 pt  ✓
+# Respuestas column geometry
+# Markers at x=20 (TL) right edge=28 pt, and x=584 (TR) left edge.
+# Bubble content starts at 34 pt (6 pt gap after TL marker) and ends ≤ 584 pt.
+_RESP_CONTENT_X0  = 34    # left of column-0 number label
+_RESP_COL_PITCH   = 94    # pt between column starts (6 cols × 94 = 564 pt)
+_RESP_NUM_W       = 15    # pt reserved for question-number label
+
+#   A_cx(col) = _RESP_CONTENT_X0 + col × _RESP_COL_PITCH + _RESP_NUM_W + R_RESP
+#             = 34 + col×94 + 15 + 8  =  57 + col×94
+#   B_cx(col) = A_cx + OPT_STEP       =  79 + col×94
+#   C_cx(col) = B_cx + OPT_STEP       = 101 + col×94
+#
+#   Verification col 5:  C_cx = 101 + 470 = 571  right_edge = 579 < 584 (TR marker) ✓
 
 
 # ---------------------------------------------------------------------------
@@ -144,118 +214,131 @@ def _y(y_from_top: float) -> float:
 
 
 def _pt2px(x_pt: float, y_from_top: float) -> list[int]:
-    """
-    PDF layout point → image pixel coordinates (top-left origin, 300 DPI).
-    Returned as a two-element list so it serialises cleanly to JSON.
-    """
+    """PDF point (bottom-left origin) → image pixel (top-left origin, 300 DPI)."""
     return [round(x_pt * PT_PX), round(y_from_top * PT_PX)]
 
 
 # ---------------------------------------------------------------------------
-# Geometry: exact bubble centres in PDF points
+# Exact bubble centres (PDF points)
 # ---------------------------------------------------------------------------
-def _resp_centers(col: int, row: int) -> dict[str, tuple[float, float]]:
-    """
-    Return {option: (x_pt, y_from_top_pt)} for one question cell.
-
-    col : 0–5   question column
-    row : 0–14  row within that column
-    """
-    a_cx = RESP_ML + col * QCOL_W + NUM_W + R_RESP
-    cy   = Y_RESP_ROW0 + row * QROW_STEP
-    return {
-        "A": (a_cx,              cy),
-        "B": (a_cx + OPT_STEP,   cy),
-        "C": (a_cx + 2*OPT_STEP, cy),
-    }
+def _resp_cx(col: int, opt_idx: int) -> float:
+    """x-centre of option opt_idx (0=A,1=B,2=C) in column col."""
+    return 57.0 + col * _RESP_COL_PITCH + opt_idx * OPT_STEP
 
 
-def _cel_center(col: int, row: int) -> tuple[float, float]:
-    """Return (x_pt, y_from_top_pt) for one celular grid cell."""
-    return (
-        CEL_CX0 + col * CEL_COL_STEP,
-        Y_CEL_ROW0 + row * CEL_ROW_STEP,
-    )
+def _resp_cy(row: int) -> float:
+    """y_from_top centre of question row."""
+    return Y_RESP_ROW0 + row * QROW_STEP
+
+
+def _cel_cx(col: int) -> float:
+    """x-centre of celular digit-position column."""
+    return CEL_CX0 + col * CEL_COL_STEP
+
+
+def _cel_cy(row: int) -> float:
+    """y_from_top centre of celular digit-value row."""
+    return Y_CEL_ROW0 + row * CEL_ROW_STEP
 
 
 # ---------------------------------------------------------------------------
-# Compute SHEET_COORDS (pixel coordinates at 300 DPI)
+# Compute SHEET_COORDS dict
 # ---------------------------------------------------------------------------
 def compute_sheet_coords() -> dict:
     """
-    Build the SHEET_COORDS dict for the RESPUESTAS section.
+    Build the complete SHEET_COORDS dict in pixel space (300 DPI, top-left origin).
 
     Returns:
         {
-          "1":  {"A": [cx_px, cy_px], "B": [...], "C": [...]},
-          …
-          "90": {…}
+          "celular": {
+            "0": {"0": [x,y], "1": [x,y], …, "9": [x,y]},   # position → digit
+            …
+            "9": {…}
+          },
+          "respuestas": {
+            "1":  {"A": [x,y], "B": [x,y], "C": [x,y]},
+            …
+            "90": {…}
+          }
         }
-
-    Questions are numbered column-by-column:
-        col 0 → Q1–Q15,  col 1 → Q16–Q30,  …  col 5 → Q76–Q90.
     """
-    coords: dict = {}
+    opts = ["A", "B", "C"]
+
+    respuestas: dict = {}
     for col in range(N_COLS):
         for row in range(N_ROWS):
-            q = col * N_ROWS + row + 1
-            centers = _resp_centers(col, row)
-            coords[str(q)] = {
-                opt: _pt2px(cx, cy) for opt, (cx, cy) in centers.items()
+            q   = col * N_ROWS + row + 1
+            cy  = _resp_cy(row)
+            respuestas[str(q)] = {
+                opts[i]: _pt2px(_resp_cx(col, i), cy) for i in range(3)
             }
-    return coords
+
+    celular: dict = {}
+    for pos in range(N_CEL_COLS):        # digit position 0–9
+        row_map: dict = {}
+        cx = _cel_cx(pos)
+        for dig in range(N_CEL_ROWS):    # digit value 0–9
+            row_map[str(dig)] = _pt2px(cx, _cel_cy(dig))
+        celular[str(pos)] = row_map
+
+    return {"celular": celular, "respuestas": respuestas}
 
 
 # ---------------------------------------------------------------------------
-# Low-level drawing helpers
+# Drawing primitives
 # ---------------------------------------------------------------------------
-def _draw_solid_marker(c, x_left: float, y_top_from_top: float) -> None:
-    """
-    Draw a solid black MARKER × MARKER pt square.
-
-    x_left           : left edge of the square in PDF points from left
-    y_top_from_top   : top edge measured from the top of the page
-    """
+def _marker(c, x_left: float, y_top: float) -> None:
+    """Draw a solid black MARKER × MARKER pt square. y_top is from page top."""
     c.setFillColor(colors.black)
     c.setStrokeColor(colors.black)
-    c.rect(
-        x_left,
-        _y(y_top_from_top + MARKER),   # ReportLab rect origin = bottom-left
-        MARKER,
-        MARKER,
-        fill=1,
-        stroke=0,
-    )
+    c.rect(x_left, _y(y_top + MARKER), MARKER, MARKER, fill=1, stroke=0)
 
 
-def _draw_bubble(
-    c,
-    cx_pt: float,
-    y_from_top: float,
-    r: float,
-    label: str = "",
-    label_gray: float = 0.72,
-    border_width: float = 0.5,
-) -> None:
+def _bubble(c, cx: float, y_from_top: float, r: float,
+            label: str = "", font_size: float = 7.0) -> None:
     """
-    Draw an empty circle bubble with a faint gray border.
-
-    Spec: diameter 14 mm, border 0.5 pt gray (0.6, 0.6, 0.6), no fill,
-          A/B/C label inside in light gray.
-    (Implemented at proportional scale for Letter paper.)
+    Draw an empty bubble (circle) per spec:
+    border 0.5 pt gray (0.65, 0.65, 0.65), no fill, label centred in light gray.
     """
     cy_pdf = _y(y_from_top)
-    c.setStrokeColor(colors.Color(0.6, 0.6, 0.6))
-    c.setLineWidth(border_width)
+    c.setStrokeColor(colors.Color(0.65, 0.65, 0.65))
+    c.setLineWidth(0.5)
     c.setFillColor(colors.white)
-    c.circle(cx_pt, cy_pdf, r, fill=1, stroke=1)
-
+    c.circle(cx, cy_pdf, r, fill=1, stroke=1)
     if label:
-        font_sz = max(3.5, r * 0.80)
-        c.setFont("Helvetica", font_sz)
-        c.setFillColor(colors.Color(label_gray, label_gray, label_gray))
-        # Vertically center the label (approximate: descend 38 % of font size)
-        c.drawCentredString(cx_pt, cy_pdf - font_sz * 0.38, label)
+        c.setFont("Helvetica", font_size)
+        c.setFillColor(colors.Color(0.70, 0.70, 0.70))
+        c.drawCentredString(cx, cy_pdf - font_size * 0.36, label)
+
+
+def _wrap_text(c, text: str, x: float, y_from_top: float,
+               max_width: float, font: str, size: float,
+               line_height: float) -> float:
+    """
+    Draw word-wrapped text. Returns y_from_top of the line AFTER the last line.
+    """
+    words  = text.split()
+    lines: list[str] = []
+    buf:   list[str] = []
+    w_used = 0.0
+
+    for word in words:
+        w = c.stringWidth(word + " ", font, size)
+        if w_used + w > max_width and buf:
+            lines.append(" ".join(buf))
+            buf    = [word]
+            w_used = w
+        else:
+            buf.append(word)
+            w_used += w
+    if buf:
+        lines.append(" ".join(buf))
+
+    c.setFont(font, size)
+    for i, line in enumerate(lines):
+        c.drawString(x, _y(y_from_top + i * line_height), line)
+
+    return y_from_top + len(lines) * line_height
 
 
 # ---------------------------------------------------------------------------
@@ -266,189 +349,170 @@ def build_sheet(exam_code: str) -> tuple[bytes, dict]:
     Generate the EVOLVI answer-sheet PDF.
 
     Returns:
-        pdf_bytes    : raw PDF content (suitable for a Flask send_file response)
-        sheet_coords : SHEET_COORDS dict  {"1": {"A": [x,y], …}, …}
+        pdf_bytes    : raw PDF bytes (send directly as application/pdf)
+        sheet_coords : SHEET_COORDS dict for OMR bubble detection
     """
     info = parse_exam_code(exam_code)
-    log.info("Building sheet for code=%s area=%s title=%s", info["code"], info["area"], info["title"])
+    log.info("Building sheet: code=%s  title=%s", info["code"], info["title"])
 
     buf = io.BytesIO()
     c   = rl_canvas.Canvas(buf, pagesize=LETTER)
 
-    center_x = PAGE_W / 2
+    # =========================================================================
+    # RIGHT COLUMN — CELULAR SECTION
+    # =========================================================================
 
-    # =========================================================================
-    # 1. PAGE-CORNER MARKERS
-    #    Four solid black squares placed near the page corners.
-    #    find_corner_markers() in app.py uses these for warpPerspective.
-    # =========================================================================
-    for mx, my_from_top in [
-        (MARK_EDGE,               MARK_EDGE),                        # TL
-        (PAGE_W - MARK_EDGE - MARKER, MARK_EDGE),                    # TR
-        (MARK_EDGE,               PAGE_H - MARK_EDGE - MARKER),      # BL
-        (PAGE_W - MARK_EDGE - MARKER, PAGE_H - MARK_EDGE - MARKER),  # BR
+    # ── Celular zone markers (TL / TR / BL / BR) ─────────────────────────────
+    for mx, my in [
+        (CEL_MARKER_L, Y_CEL_MARKER_TOP),   # TL
+        (CEL_MARKER_R, Y_CEL_MARKER_TOP),   # TR
+        (CEL_MARKER_L, Y_CEL_MARKER_BOT),   # BL
+        (CEL_MARKER_R, Y_CEL_MARKER_BOT),   # BR
     ]:
-        _draw_solid_marker(c, mx, my_from_top)
+        _marker(c, mx, my)
 
-    # =========================================================================
-    # 2. HEADER
-    # =========================================================================
-    c.setFillColor(colors.black)
-
-    c.setFont("Helvetica-Bold", 10)
-    c.drawCentredString(center_x, _y(Y_HEADER), "EXÁMENES DE SIMULACIÓN EVOLVI 2026")
-
-    c.setFont("Helvetica-Bold", 13)
-    c.drawCentredString(center_x, _y(Y_TITLE), info["title"])
-
+    # ── "CELULAR" label ────────────────────────────────────────────────────────
+    cel_center_x = (RIGHT_X + RIGHT_X_END) / 2   # = 468.5 pt
     c.setFont("Helvetica-Bold", 9)
-    c.drawCentredString(center_x, _y(Y_CODE), info["code"])
-
-    # Thin decorative line below code
-    c.setStrokeColor(colors.Color(0.6, 0.6, 0.6))
-    c.setLineWidth(0.4)
-    c.line(RESP_ML, _y(Y_CODE + 10), PAGE_W - RESP_ML, _y(Y_CODE + 10))
-
-    # =========================================================================
-    # 3. NOMBRE / APELLIDO FIELDS
-    # =========================================================================
-    field_h   = 14    # pt height of each input box
-    label_w   = 58    # pt width of the label before the box
-    field_x   = RESP_ML
-    field_box_w = PAGE_W - 2 * RESP_ML - label_w
-
-    for label, y_top in [("NOMBRE(S):", Y_NAME), ("APELLIDO(S):", Y_APELL)]:
-        baseline = y_top + field_h - 4   # text baseline within the row
-        c.setFont("Helvetica-Bold", 7)
-        c.setFillColor(colors.black)
-        c.drawString(field_x, _y(baseline), label)
-
-        c.setFillColor(colors.white)
-        c.setStrokeColor(colors.Color(0.3, 0.3, 0.3))
-        c.setLineWidth(0.5)
-        c.rect(
-            field_x + label_w,
-            _y(y_top + field_h),       # bottom of box in PDF coords
-            field_box_w,
-            field_h,
-            fill=1,
-            stroke=1,
-        )
-
-    # =========================================================================
-    # 4. CELULAR GRID  — 10 digit positions × 10 digit values (0–9)
-    # =========================================================================
-    # --- Section label ---
-    c.setFont("Helvetica-Bold", 7)
     c.setFillColor(colors.black)
-    c.drawString(RESP_ML, _y(Y_CEL_LBL), "CELULAR  (marque un dígito por columna):")
+    c.drawCentredString(cel_center_x, _y(Y_CEL_LABEL), "CELULAR")
 
-    # --- Column-position headers (1 … 10 = digit position of the phone number) ---
-    c.setFont("Helvetica-Bold", 5)
-    c.setFillColor(colors.Color(0.40, 0.40, 0.40))
+    # ── Digit-input squares ──────────────────────────────────────────────────
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(0.5)
+    c.setFillColor(colors.white)
+    for i in range(N_CEL_COLS):
+        sx = CEL_SQ_X0 + i * CEL_SQ_SIZE
+        c.rect(sx, _y(Y_CEL_SQ_BOT), CEL_SQ_SIZE, CEL_SQ_SIZE, fill=1, stroke=1)
+
+    # ── Celular bubble grid ──────────────────────────────────────────────────
     for col in range(N_CEL_COLS):
-        cx_col, _ = _cel_center(col, 0)
-        c.drawCentredString(cx_col, _y(Y_CEL_HDR), str(col + 1))
-
-    # --- Celular bubbles (row = digit value 0-9) ---
-    for row in range(N_CEL_ROWS):
-        digit = str(row)
-        cx_first, cy_first = _cel_center(0, row)
-
-        # Row label to the left of the first column
-        c.setFont("Helvetica", 5)
-        c.setFillColor(colors.Color(0.40, 0.40, 0.40))
-        c.drawRightString(cx_first - R_CEL - 3, _y(cy_first) - 2, digit)
-
-        for col in range(N_CEL_COLS):
-            cx_col, cy_col = _cel_center(col, row)
-            _draw_bubble(c, cx_col, cy_col, R_CEL, label=digit, label_gray=0.70)
-
-    # --- Celular zone corner markers ---
-    cel_grid_left  = CEL_CX0 - R_CEL
-    cel_grid_right = CEL_CX0 + (N_CEL_COLS - 1) * CEL_COL_STEP + R_CEL
-    cel_grid_top   = Y_CEL_ROW0 - R_CEL        # y from top, top edge of top-row bubbles
-    cel_grid_bot   = Y_CEL_ROW0 + (N_CEL_ROWS - 1) * CEL_ROW_STEP + R_CEL
-
-    CEL_GAP = 4   # pt between grid edge and marker
-    for mx, my_from_top in [
-        (cel_grid_left  - CEL_GAP - MARKER, cel_grid_top - CEL_GAP),          # TL
-        (cel_grid_right + CEL_GAP,          cel_grid_top - CEL_GAP),           # TR
-        (cel_grid_left  - CEL_GAP - MARKER, cel_grid_bot + CEL_GAP),           # BL
-        (cel_grid_right + CEL_GAP,          cel_grid_bot + CEL_GAP),           # BR
-    ]:
-        _draw_solid_marker(c, mx, my_from_top)
+        cx = _cel_cx(col)
+        for row in range(N_CEL_ROWS):
+            _bubble(c, cx, _cel_cy(row), R_CEL, label=str(row), font_size=7)
 
     # =========================================================================
-    # 5. RESPUESTAS GRID — 90 questions × 3 options (A / B / C)
+    # LEFT COLUMN — EXAM INFO + FIELDS + INSTRUCTIONS
     # =========================================================================
-    # --- Section label ---
+    lx = LEFT_X   # left edge of content
+    lw = LEFT_X_END - LEFT_X   # = 310 pt
+
+    # ── Exam title ─────────────────────────────────────────────────────────────
+    c.setFont("Helvetica-Bold", 14)
+    c.setFillColor(colors.black)
+    c.drawString(lx, _y(Y_TITLE), info["title"])
+
+    # ── Exam code ──────────────────────────────────────────────────────────────
+    c.setFont("Helvetica", 11)
+    c.setFillColor(colors.Color(0.40, 0.40, 0.40))
+    c.drawString(lx, _y(Y_CODE), info["code"])
+
+    # ── NOMBRE field ───────────────────────────────────────────────────────────
     c.setFont("Helvetica-Bold", 8)
     c.setFillColor(colors.black)
-    c.drawString(RESP_ML, _y(Y_RESP_LBL), "RESPUESTAS")
+    c.drawString(lx, _y(Y_NOMBRE_LBL), "NOMBRE(S)")
 
-    c.setStrokeColor(colors.Color(0.5, 0.5, 0.5))
-    c.setLineWidth(0.4)
-    c.line(RESP_ML, _y(Y_RESP_LBL + 4), PAGE_W - RESP_ML, _y(Y_RESP_LBL + 4))
+    c.setFillColor(colors.white)
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(0.5)
+    c.rect(lx, _y(Y_NOMBRE_BOT), lw, Y_NOMBRE_BOT - Y_NOMBRE_TOP, fill=1, stroke=1)
 
-    # --- A / B / C column headers ---
-    c.setFont("Helvetica-Bold", 5.5)
+    # ── APELLIDO field ─────────────────────────────────────────────────────────
+    c.setFont("Helvetica-Bold", 8)
+    c.setFillColor(colors.black)
+    c.drawString(lx, _y(Y_APELL_LBL), "APELLIDO(S)")
+
+    c.setFillColor(colors.white)
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(0.5)
+    c.rect(lx, _y(Y_APELL_BOT), lw, Y_APELL_BOT - Y_APELL_TOP, fill=1, stroke=1)
+
+    # ── INSTRUCCIONES ──────────────────────────────────────────────────────────
+    c.setFont("Helvetica-Bold", 8)
+    c.setFillColor(colors.black)
+    c.drawString(lx, _y(Y_INST_LBL), "INSTRUCCIONES:")
+
+    c.setFillColor(colors.Color(0.15, 0.15, 0.15))
+    _wrap_text(c, INSTRUCTIONS, lx, Y_INST_TEXT, lw, "Helvetica", 6.5, 9.0)
+
+    # =========================================================================
+    # SEPARATOR LINE
+    # =========================================================================
+    c.setStrokeColor(colors.Color(0.55, 0.55, 0.55))
+    c.setLineWidth(0.5)
+    c.line(LEFT_X, _y(Y_SEPARATOR), RIGHT_X_END, _y(Y_SEPARATOR))
+
+    # =========================================================================
+    # RESPUESTAS SECTION
+    # =========================================================================
+
+    # ── Respuestas zone markers (TL / TR / BL / BR) ───────────────────────────
+    resp_marker_l = LEFT_X               # = 20 pt
+    resp_marker_r = RIGHT_X_END - MARKER # = 584 pt
+    for mx, my in [
+        (resp_marker_l, Y_RESP_MARKER_TOP),   # TL
+        (resp_marker_r, Y_RESP_MARKER_TOP),   # TR
+        (resp_marker_l, Y_RESP_MARKER_BOT),   # BL
+        (resp_marker_r, Y_RESP_MARKER_BOT),   # BR
+    ]:
+        _marker(c, mx, my)
+
+    # ── Section label ──────────────────────────────────────────────────────────
+    c.setFont("Helvetica-Bold", 11)
+    c.setFillColor(colors.black)
+    c.drawString(LEFT_X, _y(Y_RESP_LABEL), "RESPUESTAS")
+
+    # ── A / B / C column headers ───────────────────────────────────────────────
+    opts = ["A", "B", "C"]
+    c.setFont("Helvetica-Bold", 6)
     c.setFillColor(colors.Color(0.35, 0.35, 0.35))
     for col in range(N_COLS):
-        for opt, (cx, _) in _resp_centers(col, 0).items():
-            c.drawCentredString(cx, _y(Y_RESP_HDR), opt)
+        for i, opt in enumerate(opts):
+            c.drawCentredString(_resp_cx(col, i), _y(Y_RESP_HDRS), opt)
 
-    # --- Bubbles + question numbers ---
+    # ── Bubbles + question numbers ─────────────────────────────────────────────
     for col in range(N_COLS):
         for row in range(N_ROWS):
-            q_num   = col * N_ROWS + row + 1
-            centers = _resp_centers(col, row)
-            a_cx, cy = centers["A"]
+            q_num = col * N_ROWS + row + 1
+            cy    = _resp_cy(row)
+            a_cx  = _resp_cx(col, 0)
 
-            # Question number to the left of bubble A
-            c.setFont("Helvetica", 5)
+            # Question number — right-aligned, just left of bubble A
+            c.setFont("Helvetica-Bold", 5.5)
             c.setFillColor(colors.black)
             c.drawRightString(a_cx - R_RESP - 2, _y(cy) - 2, str(q_num))
 
-            # Three bubbles
-            for opt, (cx, bcy) in centers.items():
-                _draw_bubble(c, cx, bcy, R_RESP, label=opt)
+            # Bubbles A, B, C
+            for i, opt in enumerate(opts):
+                _bubble(c, _resp_cx(col, i), cy, R_RESP, label=opt, font_size=6)
 
     # =========================================================================
-    # 6. FOOTER — EVOLVI logo
+    # FOOTER
     # =========================================================================
-    # Footer sits between last bubble (bottom ≈ 718 pt from top) and
-    # the bottom page-corner markers (start ≈ 757 pt from top).
-    footer_pdf_y = MARK_EDGE + MARKER + 14   # ≈ 49 pt from PDF bottom = 743 pt from top
+    c.setFont("Helvetica", 7)
+    c.setFillColor(colors.Color(0.40, 0.40, 0.40))
+    c.drawString(LEFT_X, _y(Y_FOOTER), info["code"])
+    c.setFont("Helvetica-Bold", 7)
+    c.setFillColor(colors.Color(0.13, 0.31, 0.65))
+    c.drawRightString(RIGHT_X_END, _y(Y_FOOTER), "EVOLVI")
 
-    c.setFont("Helvetica-Bold", 10)
-    c.setFillColor(colors.Color(0.13, 0.31, 0.65))   # EVOLVI blue
-    c.drawCentredString(center_x, footer_pdf_y + 6, "EVOLVI")
-
-    c.setFont("Helvetica", 5)
-    c.setFillColor(colors.Color(0.50, 0.50, 0.50))
-    c.drawCentredString(
-        center_x,
-        footer_pdf_y - 1,
-        "Plataforma de Simulación Académica  ·  evolvi.pe",
-    )
-
-    # =========================================================================
-    # 7. Finalise PDF
     # =========================================================================
     c.showPage()
     c.save()
 
     sheet_coords = compute_sheet_coords()
     log.info(
-        "Sheet built: code=%s  bubbles=%d  pdf_bytes=%d",
-        info["code"], len(sheet_coords) * 3, len(buf.getvalue()),
+        "Sheet built: code=%s  resp_bubbles=%d  cel_bubbles=%d  pdf=%d bytes",
+        info["code"],
+        len(sheet_coords["respuestas"]) * 3,
+        N_CEL_COLS * N_CEL_ROWS,
+        len(buf.getvalue()),
     )
     return buf.getvalue(), sheet_coords
 
 
 # ---------------------------------------------------------------------------
-# CLI helper (python generate_sheet.py EV-ATR-JUN26 → writes sheet.pdf)
+# CLI: python generate_sheet.py EV-ATR-JUN26
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
@@ -456,11 +520,13 @@ if __name__ == "__main__":
     code = sys.argv[1] if len(sys.argv) > 1 else "EV-ATR-JUN26"
     pdf_bytes, coords = build_sheet(code)
 
-    out_pdf   = Path("sheet.pdf")
-    out_json  = Path("sheet_coords.json")
+    out_pdf  = Path("sheet.pdf")
+    out_json = Path("sheet_coords.json")
 
     out_pdf.write_bytes(pdf_bytes)
-    out_json.write_text(json.dumps(coords, indent=2))
+    out_json.write_text(json.dumps(coords, indent=2, ensure_ascii=False))
 
+    n_resp = len(coords["respuestas"])
+    n_cel  = sum(len(v) for v in coords["celular"].values())
     print(f"PDF  → {out_pdf}  ({len(pdf_bytes):,} bytes)")
-    print(f"JSON → {out_json}  ({len(coords)} questions, {len(coords)*3} bubbles)")
+    print(f"JSON → {out_json}  ({n_resp} preguntas, {n_resp*3} resp bubbles, {n_cel} cel bubbles)")
