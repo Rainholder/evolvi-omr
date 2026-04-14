@@ -75,40 +75,42 @@ def decode_image(b64_str: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Helper: find the 4 corner markers
 # ---------------------------------------------------------------------------
-def find_corner_markers(binary: np.ndarray) -> np.ndarray:
+
+# Fixed threshold values tried in order.  50 isolates only very dark ink;
+# 80 and 100 are fallbacks for lower-contrast or compressed images.
+_MARKER_THRESHOLDS = (50, 80, 100)
+
+# Absolute pixel area bounds for the solid black squares (~8 mm).
+# Wide enough to work across phone photos (72 dpi-equivalent) up to
+# flatbed scans (300 dpi).
+_MARKER_AREA_MIN = 200
+_MARKER_AREA_MAX = 5000
+
+
+def _filter_marker_candidates(gray: np.ndarray, thresh_val: int) -> tuple[list, int]:
     """
-    Locate the 4 solid black square corner markers.
+    Apply a fixed BINARY_INV threshold and return filtered marker candidates.
 
-    Strategy:
-      1. Find all external contours on the *inverted* binary (markers are
-         dark, so they appear as white blobs on an inverted image).
-      2. Filter by:
-         - Roughly square aspect ratio (0.7 – 1.4)
-         - Area within a plausible range for ~8 mm squares
-         - High solidity (> 0.85) — they are solid squares, not rings
-      3. Return the 4 corners ordered: TL, TR, BR, BL.
+    BINARY_INV turns pixels darker than thresh_val into white (255) and
+    everything else to black — isolating the solid black squares as white blobs.
 
-    Returns an (4, 2) float32 array of corner centres.
+    Returns:
+        candidates  : list of (cx, cy) float tuples that pass all shape filters
+        total_cnts  : total raw contour count before filtering (for debug logs)
     """
-    h, w = binary.shape
-
-    # Markers are black → they are 0 in the binary image.
-    # Invert so they become white foreground.
-    inverted = cv2.bitwise_not(binary)
-
-    contours, _ = cv2.findContours(inverted, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    log.debug("Total contours found: %d", len(contours))
-
-    # Plausible area range: markers are ~8 mm; at typical scan DPI the marker
-    # covers 0.3–3 % of the image area.
-    img_area = h * w
-    min_area = img_area * 0.0008
-    max_area = img_area * 0.03
+    _, binary_inv = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(binary_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    total_cnts = len(contours)
 
     candidates = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < min_area or area > max_area:
+        if not (_MARKER_AREA_MIN <= area <= _MARKER_AREA_MAX):
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        aspect = bw / bh if bh > 0 else 0
+        if not (0.5 < aspect < 2.0):
             continue
 
         hull = cv2.convexHull(cnt)
@@ -116,64 +118,91 @@ def find_corner_markers(binary: np.ndarray) -> np.ndarray:
         if hull_area == 0:
             continue
         solidity = area / hull_area
-        if solidity < 0.80:
+        if solidity < 0.85:
             continue
 
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        aspect = bw / bh if bh > 0 else 0
-        if not (0.6 < aspect < 1.7):
-            continue
-
-        cx = x + bw / 2
-        cy = y + bh / 2
-        candidates.append((cx, cy, area))
-        log.debug("Marker candidate: centre=(%.1f, %.1f) area=%.0f solidity=%.2f aspect=%.2f",
-                  cx, cy, area, solidity, aspect)
-
-    if len(candidates) < 4:
-        raise RuntimeError(
-            f"Expected 4 corner markers, found only {len(candidates)} candidates. "
-            "Check image quality and that markers are visible."
+        cx = x + bw / 2.0
+        cy = y + bh / 2.0
+        candidates.append((cx, cy))
+        log.debug(
+            "  thresh=%d candidate: centre=(%.1f, %.1f) area=%.0f aspect=%.2f solidity=%.2f",
+            thresh_val, cx, cy, area, aspect, solidity,
         )
 
-    # If more than 4 candidates, keep the 4 most extreme (one per quadrant)
-    centres = np.array([(c[0], c[1]) for c in candidates], dtype=np.float32)
-    ordered = _order_four_corners(centres, w, h)
-    log.info("Corner markers (TL, TR, BR, BL): %s", ordered.tolist())
-    return ordered
+    return candidates, total_cnts
 
 
-def _order_four_corners(pts: np.ndarray, w: int, h: int) -> np.ndarray:
+def _pick_nearest_to_corners(candidates: list, w: int, h: int) -> np.ndarray:
     """
-    Given N candidate points, pick the best one for each quadrant (TL/TR/BR/BL)
-    and return them in that order.
+    Given a list of (cx, cy) candidates, assign one point to each of the
+    4 image corners (TL, TR, BR, BL) by nearest Euclidean distance.
+
+    Each candidate is used at most once.  Returns an (4, 2) float32 array
+    ordered TL → TR → BR → BL, matching the warpPerspective destination.
     """
-    mid_x, mid_y = w / 2, h / 2
-
-    def quadrant_score(pt, prefer_left: bool, prefer_top: bool):
-        x, y = pt
-        dx = (mid_x - x) if prefer_left else (x - mid_x)
-        dy = (mid_y - y) if prefer_top  else (y - mid_y)
-        return dx + dy   # larger = more extreme in that quadrant
-
-    quads = [
-        (True,  True),   # TL
-        (False, True),   # TR
-        (False, False),  # BR
-        (True,  False),  # BL
+    image_corners = [
+        (0.0, 0.0),   # TL
+        (w,   0.0),   # TR
+        (w,   h  ),   # BR
+        (0.0, h  ),   # BL
     ]
-
+    pts = list(candidates)
     result = []
     used = set()
-    for prefer_left, prefer_top in quads:
-        best_idx = max(
+
+    for ic_x, ic_y in image_corners:
+        best_idx = min(
             (i for i in range(len(pts)) if i not in used),
-            key=lambda i: quadrant_score(pts[i], prefer_left, prefer_top),
+            key=lambda i: (pts[i][0] - ic_x) ** 2 + (pts[i][1] - ic_y) ** 2,
         )
         result.append(pts[best_idx])
         used.add(best_idx)
 
     return np.array(result, dtype=np.float32)
+
+
+def find_corner_markers(gray: np.ndarray) -> np.ndarray:
+    """
+    Locate the 4 solid black square corner markers using progressive thresholds.
+
+    Tries threshold values 50 → 80 → 100 in order, stopping as soon as at
+    least 4 valid candidates are found.  From those candidates the 4 points
+    closest to the image corners (TL/TR/BR/BL) are selected.
+
+    Args:
+        gray: single-channel (grayscale) image — no pre-thresholding required.
+
+    Returns:
+        (4, 2) float32 array ordered TL, TR, BR, BL.
+
+    Raises:
+        RuntimeError if no threshold produces ≥ 4 candidates.
+    """
+    h, w = gray.shape
+    last_candidates: list = []
+
+    for thresh_val in _MARKER_THRESHOLDS:
+        candidates, total_cnts = _filter_marker_candidates(gray, thresh_val)
+        log.info(
+            "Marker search thresh=%d: %d raw contours → %d candidates",
+            thresh_val, total_cnts, len(candidates),
+        )
+
+        if len(candidates) >= 4:
+            ordered = _pick_nearest_to_corners(candidates, w, h)
+            log.info(
+                "Corner markers found at thresh=%d (TL, TR, BR, BL): %s",
+                thresh_val, ordered.tolist(),
+            )
+            return ordered
+
+        last_candidates = candidates  # keep for error message
+
+    raise RuntimeError(
+        f"Could not find 4 corner markers after trying thresholds {_MARKER_THRESHOLDS}. "
+        f"Last attempt found {len(last_candidates)} candidate(s). "
+        "Check that the 4 black corner squares are fully visible and not cropped."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -267,17 +296,17 @@ def process_omr(img: np.ndarray, total_preguntas: int) -> dict:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     log.debug("Grayscale OK")
 
-    # 2. Gaussian blur to reduce noise before thresholding
+    # 2. Find corner markers directly on the grayscale image.
+    #    The new detector applies its own fixed-threshold binarisation
+    #    internally, so we do NOT pre-threshold here.
+    corners = find_corner_markers(gray)
+
+    # 3. Gaussian blur + Otsu binarisation — used only for bubble reading
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # 3. Otsu binarisation — separates dark ink from white paper
     _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    log.debug("Otsu threshold OK")
+    log.debug("Otsu threshold OK (bubble reading)")
 
-    # 4. Find corner markers on the binary image
-    corners = find_corner_markers(binary)
-
-    # 5. Perspective correction
+    # 4. Perspective correction
     warped_color = warp_perspective(img, corners)
     warped_gray  = cv2.cvtColor(warped_color, cv2.COLOR_BGR2GRAY)
     _, warped_bin = cv2.threshold(warped_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -334,6 +363,89 @@ def procesar():
     except Exception as exc:
         log.error("Unexpected error:\n%s", traceback.format_exc())
         return jsonify({"ok": False, "error": "Internal server error", "detail": str(exc)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Debug endpoint — contour counts per threshold, no full OMR
+# ---------------------------------------------------------------------------
+@app.route("/debug", methods=["GET", "POST"])
+def debug():
+    """
+    Inspect how many contours and marker candidates are found at each
+    threshold without running the full OMR pipeline.
+
+    Accepts JSON body (works with both GET and POST):
+        { "imagen_base64": "<base64 string>" }
+
+    Returns per-threshold breakdown plus basic image info:
+        {
+          "image_shape": [h, w],
+          "thresholds": {
+            "50":  {"raw_contours": 312, "after_area": 8, "after_aspect": 6, "after_solidity": 4},
+            "80":  {...},
+            "100": {...}
+          }
+        }
+    """
+    log.info("%s /debug received", request.method)
+
+    data = request.get_json(silent=True) or {}
+    if "imagen_base64" not in data:
+        return jsonify({"ok": False, "error": "Missing field: imagen_base64"}), 400
+
+    try:
+        img = decode_image(data["imagen_base64"])
+    except Exception as exc:
+        log.error("Debug image decode failed: %s", exc)
+        return jsonify({"ok": False, "error": f"Image decode error: {exc}"}), 422
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    threshold_results = {}
+
+    for thresh_val in _MARKER_THRESHOLDS:
+        _, binary_inv = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(binary_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        raw = len(contours)
+
+        after_area = after_aspect = after_solidity = 0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if not (_MARKER_AREA_MIN <= area <= _MARKER_AREA_MAX):
+                continue
+            after_area += 1
+
+            bx, by, bw2, bh2 = cv2.boundingRect(cnt)
+            aspect = bw2 / bh2 if bh2 > 0 else 0
+            if not (0.5 < aspect < 2.0):
+                continue
+            after_aspect += 1
+
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            if hull_area == 0:
+                continue
+            if (area / hull_area) < 0.85:
+                continue
+            after_solidity += 1
+
+        threshold_results[str(thresh_val)] = {
+            "raw_contours": raw,
+            "after_area_filter": after_area,
+            "after_aspect_filter": after_aspect,
+            "after_solidity_filter": after_solidity,
+        }
+        log.info(
+            "Debug thresh=%d: raw=%d area=%d aspect=%d solidity=%d",
+            thresh_val, raw, after_area, after_aspect, after_solidity,
+        )
+
+    return jsonify({
+        "ok": True,
+        "image_shape": [h, w],
+        "marker_area_range": [_MARKER_AREA_MIN, _MARKER_AREA_MAX],
+        "thresholds": threshold_results,
+    }), 200
 
 
 # ---------------------------------------------------------------------------
