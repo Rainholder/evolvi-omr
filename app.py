@@ -1,15 +1,24 @@
 """
-OMR (Optical Mark Recognition) microservice for answer sheet processing.
+OMR (Optical Mark Recognition) microservice — template-matching edition.
 
-Sheet layout (known, fixed):
-  - 6 columns x 15 rows = 90 questions
-  - 3 bubbles per question: A (left), B (center), C (right)
-  - 4 solid black square corner markers delimiting the answer grid
-  - Bubble diameter: ~14 mm | Center-to-center spacing: 18 mm
+Architecture:
+  1. POST /setup-template  — send a blank template image; HoughCircles detects
+                             all 270 bubble positions ONCE and stores them in
+                             memory.  Must be called before /procesar.
+  2. POST /procesar        — send a student photo; the service aligns it to the
+                             template via corner markers + warpPerspective, then
+                             reads each bubble at the stored coordinates.
+
+Sheet layout (fixed):
+  - 6 question-columns × 15 rows = 90 questions
+  - 3 bubbles per question (A, B, C) left-to-right
+  - 4 solid black square corner markers at the grid corners
 """
 
 import base64
+import json
 import logging
+import os
 import sys
 import traceback
 
@@ -30,30 +39,59 @@ log = logging.getLogger("omr")
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Sheet constants  (all values are in the *warped* coordinate system after
-# perspective correction; calibrated to a 1 200 x 900 px output canvas)
+# Known sheet layout constants
 # ---------------------------------------------------------------------------
-WARP_W = 1200          # px — width  of the rectified grid area
-WARP_H = 900           # px — height of the rectified grid area
+N_COLS    = 6    # question-columns side by side
+N_ROWS    = 15   # questions per column
+N_OPTIONS = 3    # A, B, C
+TOTAL_BUBBLES = N_COLS * N_ROWS * N_OPTIONS   # 270
 
-N_COLS = 6             # groups of questions side by side
-N_ROWS = 15            # questions per column
-N_OPTIONS = 3          # A, B, C
+# Minimum dark-pixel fraction to declare a bubble "filled".
+FILL_THRESHOLD = 0.18
 
-# Spacing (px) in the warped canvas – derived from 18 mm @ ~50 px/mm
-COL_STEP = WARP_W / N_COLS          # 200 px between column centres
-ROW_STEP = WARP_H / N_ROWS          # 60  px between row centres
+# ---------------------------------------------------------------------------
+# Global template state
+#   TEMPLATE_CIRCLES  : dict  {"1": {"A": [cx,cy,r], ...}, ..., "90": {...}}
+#   TEMPLATE_DIMS     : tuple (width_px, height_px) of the template image
+# Both are None until /setup-template is successfully called.
+# ---------------------------------------------------------------------------
+TEMPLATE_CIRCLES: dict | None = None
+TEMPLATE_DIMS:    tuple | None = None
 
-# First bubble centre (top-left bubble = Q1-A)
-FIRST_X = COL_STEP / 2             # 100 px
-FIRST_Y = ROW_STEP / 2             # 30  px
+# Optional on-disk persistence — survives server restarts on Render.com.
+_STATE_FILE = "template_state.json"
 
-# Bubble geometry
-BUBBLE_RADIUS = 18                  # px (≈ 14 mm scaled)
-OPTION_STEP = 40                    # px between A/B/C centres in same row
 
-# Decision threshold: fraction of bubble area that must be dark to be "filled"
-FILL_THRESHOLD = 0.18               # 18 % of the bubble circle
+def _save_template_state() -> None:
+    """Write current template state to disk so it survives restarts."""
+    try:
+        with open(_STATE_FILE, "w") as f:
+            json.dump({"dims": list(TEMPLATE_DIMS), "circles": TEMPLATE_CIRCLES}, f)
+        log.info("Template state saved to %s", _STATE_FILE)
+    except Exception as exc:
+        log.warning("Could not save template state: %s", exc)
+
+
+def _load_template_state() -> None:
+    """Load template state from disk if available."""
+    global TEMPLATE_CIRCLES, TEMPLATE_DIMS
+    if not os.path.exists(_STATE_FILE):
+        return
+    try:
+        with open(_STATE_FILE) as f:
+            data = json.load(f)
+        TEMPLATE_DIMS    = tuple(data["dims"])
+        TEMPLATE_CIRCLES = data["circles"]
+        log.info(
+            "Template state loaded from %s — %d questions, dims=%s",
+            _STATE_FILE, len(TEMPLATE_CIRCLES), TEMPLATE_DIMS,
+        )
+    except Exception as exc:
+        log.warning("Could not load template state from disk: %s", exc)
+
+
+# Load on startup
+_load_template_state()
 
 
 # ---------------------------------------------------------------------------
@@ -73,30 +111,20 @@ def decode_image(b64_str: str) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Helper: find the 4 corner markers
+# Corner marker detection
 # ---------------------------------------------------------------------------
-
-# Fixed threshold values tried in order.  50 isolates only very dark ink;
-# 80 and 100 are fallbacks for lower-contrast or compressed images.
 _MARKER_THRESHOLDS = (50, 80, 100)
-
-# Absolute pixel area bounds for the solid black squares (~8 mm).
-# Wide enough to work across phone photos (72 dpi-equivalent) up to
-# flatbed scans (300 dpi).
-_MARKER_AREA_MIN = 200
-_MARKER_AREA_MAX = 5000
+_MARKER_AREA_MIN   = 200
+_MARKER_AREA_MAX   = 5000
 
 
 def _filter_marker_candidates(gray: np.ndarray, thresh_val: int) -> tuple[list, int]:
     """
-    Apply a fixed BINARY_INV threshold and return filtered marker candidates.
-
-    BINARY_INV turns pixels darker than thresh_val into white (255) and
-    everything else to black — isolating the solid black squares as white blobs.
+    Apply THRESH_BINARY_INV at a fixed level and return shape-filtered candidates.
 
     Returns:
-        candidates  : list of (cx, cy) float tuples that pass all shape filters
-        total_cnts  : total raw contour count before filtering (for debug logs)
+        candidates : list of (cx, cy) float tuples
+        total_cnts : raw contour count before filtering (for /debug logs)
     """
     _, binary_inv = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY_INV)
     contours, _ = cv2.findContours(binary_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -121,12 +149,10 @@ def _filter_marker_candidates(gray: np.ndarray, thresh_val: int) -> tuple[list, 
         if solidity < 0.85:
             continue
 
-        cx = x + bw / 2.0
-        cy = y + bh / 2.0
-        candidates.append((cx, cy))
+        candidates.append((x + bw / 2.0, y + bh / 2.0))
         log.debug(
-            "  thresh=%d candidate: centre=(%.1f, %.1f) area=%.0f aspect=%.2f solidity=%.2f",
-            thresh_val, cx, cy, area, aspect, solidity,
+            "  thresh=%d marker cand: (%.0f, %.0f) area=%.0f aspect=%.2f solid=%.2f",
+            thresh_val, x + bw / 2.0, y + bh / 2.0, area, aspect, solidity,
         )
 
     return candidates, total_cnts
@@ -134,156 +160,272 @@ def _filter_marker_candidates(gray: np.ndarray, thresh_val: int) -> tuple[list, 
 
 def _pick_nearest_to_corners(candidates: list, w: int, h: int) -> np.ndarray:
     """
-    Given a list of (cx, cy) candidates, assign one point to each of the
-    4 image corners (TL, TR, BR, BL) by nearest Euclidean distance.
+    Assign one candidate to each image corner (TL, TR, BR, BL) by nearest
+    Euclidean distance.  Each candidate is used at most once.
 
-    Each candidate is used at most once.  Returns an (4, 2) float32 array
-    ordered TL → TR → BR → BL, matching the warpPerspective destination.
+    Returns (4, 2) float32 ordered TL → TR → BR → BL.
     """
-    image_corners = [
-        (0.0, 0.0),   # TL
-        (w,   0.0),   # TR
-        (w,   h  ),   # BR
-        (0.0, h  ),   # BL
-    ]
-    pts = list(candidates)
-    result = []
-    used = set()
-
+    image_corners = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]
+    pts, used, result = list(candidates), set(), []
     for ic_x, ic_y in image_corners:
-        best_idx = min(
+        best = min(
             (i for i in range(len(pts)) if i not in used),
             key=lambda i: (pts[i][0] - ic_x) ** 2 + (pts[i][1] - ic_y) ** 2,
         )
-        result.append(pts[best_idx])
-        used.add(best_idx)
-
+        result.append(pts[best])
+        used.add(best)
     return np.array(result, dtype=np.float32)
 
 
 def find_corner_markers(gray: np.ndarray) -> np.ndarray:
     """
-    Locate the 4 solid black square corner markers using progressive thresholds.
+    Locate 4 solid black square corner markers using thresholds 50 → 80 → 100.
+    Stops at the first threshold that yields ≥ 4 candidates.
 
-    Tries threshold values 50 → 80 → 100 in order, stopping as soon as at
-    least 4 valid candidates are found.  From those candidates the 4 points
-    closest to the image corners (TL/TR/BR/BL) are selected.
-
-    Args:
-        gray: single-channel (grayscale) image — no pre-thresholding required.
-
-    Returns:
-        (4, 2) float32 array ordered TL, TR, BR, BL.
-
-    Raises:
-        RuntimeError if no threshold produces ≥ 4 candidates.
+    Returns (4, 2) float32 ordered TL, TR, BR, BL.
+    Raises RuntimeError if all thresholds fail.
     """
     h, w = gray.shape
-    last_candidates: list = []
-
+    last: list = []
     for thresh_val in _MARKER_THRESHOLDS:
         candidates, total_cnts = _filter_marker_candidates(gray, thresh_val)
         log.info(
             "Marker search thresh=%d: %d raw contours → %d candidates",
             thresh_val, total_cnts, len(candidates),
         )
-
         if len(candidates) >= 4:
             ordered = _pick_nearest_to_corners(candidates, w, h)
-            log.info(
-                "Corner markers found at thresh=%d (TL, TR, BR, BL): %s",
-                thresh_val, ordered.tolist(),
-            )
+            log.info("Markers found thresh=%d → %s", thresh_val, ordered.tolist())
             return ordered
-
-        last_candidates = candidates  # keep for error message
+        last = candidates
 
     raise RuntimeError(
-        f"Could not find 4 corner markers after trying thresholds {_MARKER_THRESHOLDS}. "
-        f"Last attempt found {len(last_candidates)} candidate(s). "
-        "Check that the 4 black corner squares are fully visible and not cropped."
+        f"Could not find 4 corner markers (tried thresholds {_MARKER_THRESHOLDS}). "
+        f"Last attempt: {len(last)} candidate(s). "
+        "Ensure the 4 black corner squares are fully visible and unobstructed."
     )
 
 
 # ---------------------------------------------------------------------------
-# Helper: perspective correction
+# Perspective correction
 # ---------------------------------------------------------------------------
-def warp_perspective(img: np.ndarray, corners: np.ndarray) -> np.ndarray:
+def warp_to_template(img: np.ndarray, corners: np.ndarray) -> np.ndarray:
     """
-    Rectify the answer grid using the 4 detected corner markers.
-    The output is always WARP_W x WARP_H pixels.
+    Rectify the answer grid to exactly the template canvas size (TEMPLATE_DIMS).
+    Requires TEMPLATE_DIMS to be set.
     """
-    dst = np.array([
-        [0,      0     ],
-        [WARP_W, 0     ],
-        [WARP_W, WARP_H],
-        [0,      WARP_H],
-    ], dtype=np.float32)
-
+    tw, th = TEMPLATE_DIMS
+    dst = np.array(
+        [[0, 0], [tw, 0], [tw, th], [0, th]], dtype=np.float32
+    )
     M = cv2.getPerspectiveTransform(corners, dst)
-    warped = cv2.warpPerspective(img, M, (WARP_W, WARP_H))
-    log.debug("Warped image shape: %s", warped.shape)
+    warped = cv2.warpPerspective(img, M, (tw, th))
+    log.debug("Warped to template size (%d × %d)", tw, th)
     return warped
 
 
 # ---------------------------------------------------------------------------
-# Helper: bubble reading
+# Template circle detection
 # ---------------------------------------------------------------------------
-def bubble_dark_fraction(binary_warped: np.ndarray, cx: int, cy: int, r: int) -> float:
+def _detect_template_circles(gray: np.ndarray) -> list[tuple[int, int, int]]:
     """
-    Return the fraction of pixels inside the circle (cx, cy, r) that are dark
-    (value == 0 in the binary image where dark = filled bubble).
+    Run HoughCircles on the blank template's grayscale image.
+
+    Parameters are derived from the image dimensions, assuming Letter paper
+    (215.9 mm wide).  Tries progressively lower accumulator thresholds until
+    the detected count is in the range [260, 280] (= 270 ± 10).
+
+    Returns a list of (cx, cy, r) integer tuples.
+    Raises RuntimeError if no parameter set yields a plausible count.
     """
-    h, w = binary_warped.shape
-    mask = np.zeros((h, w), dtype=np.uint8)
+    h, w = gray.shape
+    px_per_mm  = w / 215.9                  # assumes Letter paper width
+    r_est      = int(7.0  * px_per_mm)      # 14 mm diameter → 7 mm radius
+    min_dist   = int(14.0 * px_per_mm)      # tighter than smallest option gap
+    min_r      = max(4, int(r_est * 0.60))
+    max_r      = int(r_est * 1.40)
+
+    log.info(
+        "HoughCircles init: image=%dx%d px_per_mm=%.1f r_est=%d minDist=%d r=[%d,%d]",
+        w, h, px_per_mm, r_est, min_dist, min_r, max_r,
+    )
+
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+
+    best_circles = None
+    best_delta   = float("inf")
+
+    # param2 = accumulator threshold; lower → more (potentially false) circles.
+    for param2 in (50, 40, 30, 25, 20, 15):
+        raw = cv2.HoughCircles(
+            blurred,
+            cv2.HOUGH_GRADIENT,
+            dp=1,
+            minDist=min_dist,
+            param1=50,
+            param2=param2,
+            minRadius=min_r,
+            maxRadius=max_r,
+        )
+        n = 0 if raw is None else raw.shape[1]
+        log.info("HoughCircles param2=%d → %d circles (target %d)", param2, n, TOTAL_BUBBLES)
+
+        if raw is not None:
+            delta = abs(n - TOTAL_BUBBLES)
+            if delta < best_delta:
+                best_delta   = delta
+                best_circles = raw
+            if 260 <= n <= 280:
+                log.info("Accepted param2=%d with %d circles", param2, n)
+                break
+
+    if best_circles is None:
+        raise RuntimeError("HoughCircles found no circles on the template image.")
+
+    n = best_circles.shape[1]
+    if not (260 <= n <= 280):
+        log.warning(
+            "Best attempt found %d circles (expected ~270). "
+            "Detection may be inaccurate — check template image quality.",
+            n,
+        )
+
+    return [(int(c[0]), int(c[1]), int(c[2])) for c in best_circles[0]]
+
+
+def _sort_circles_to_questions(circles: list) -> dict:
+    """
+    Organise raw (cx, cy, r) circles into a question-keyed dict.
+
+    Layout assumption:
+      - 18 x-columns  (6 question-columns × 3 option-columns A/B/C)
+      - 15 rows per x-column (one circle per question per option)
+      - Questions numbered column-by-column: Q1–15 in col 0, Q16–30 in col 1, …
+
+    Strategy:
+      1. Sort circles by x.
+      2. Locate 17 largest x-gaps → split into 18 x-columns.
+      3. Sort each x-column by y.
+      4. Group x-columns in consecutive triples → A (left), B (mid), C (right).
+      5. Build question dict.
+
+    Returns:
+        {
+          "1":  {"A": [cx, cy, r], "B": [cx, cy, r], "C": [cx, cy, r]},
+          ...
+          "90": {...}
+        }
+    """
+    n_xcols = N_COLS * N_OPTIONS   # 18
+
+    # ---- Step 1: sort by x ------------------------------------------------
+    sorted_c = sorted(circles, key=lambda c: c[0])
+    xs       = np.array([c[0] for c in sorted_c], dtype=float)
+
+    # ---- Step 2: find 17 largest gaps → 18 x-columns ----------------------
+    diffs         = np.diff(xs)
+    split_indices = np.sort(np.argsort(diffs)[::-1][:n_xcols - 1]) + 1
+    x_col_idx_groups = np.split(np.arange(len(sorted_c)), split_indices)
+    x_cols = [[sorted_c[i] for i in grp] for grp in x_col_idx_groups]
+
+    log.info(
+        "Circle sorting: %d circles → %d x-columns (expected %d), "
+        "sizes: %s",
+        len(circles), len(x_cols), n_xcols,
+        [len(g) for g in x_cols],
+    )
+
+    # ---- Step 3: sort each x-column by y ----------------------------------
+    x_cols = [sorted(col, key=lambda c: c[1]) for col in x_cols]
+
+    # ---- Step 4-5: group into question dict --------------------------------
+    options  = ["A", "B", "C"]
+    q_map    = {}
+    warnings = []
+
+    for qcol in range(N_COLS):                        # 0-5
+        triple = x_cols[qcol * N_OPTIONS : qcol * N_OPTIONS + N_OPTIONS]
+
+        for row in range(N_ROWS):                     # 0-14
+            q_num = str(qcol * N_ROWS + row + 1)
+            entry = {}
+            for opt_i, opt in enumerate(options):
+                if opt_i < len(triple) and row < len(triple[opt_i]):
+                    c = triple[opt_i][row]
+                    entry[opt] = [c[0], c[1], c[2]]
+                else:
+                    entry[opt] = None
+                    warnings.append(f"Q{q_num}/{opt} missing in template circles")
+            q_map[q_num] = entry
+
+    if warnings:
+        log.warning("Incomplete circles detected:\n  %s", "\n  ".join(warnings[:10]))
+
+    log.info("Sorted %d circles into %d questions", len(circles), len(q_map))
+    return q_map
+
+
+# ---------------------------------------------------------------------------
+# Bubble reading (uses template coordinates)
+# ---------------------------------------------------------------------------
+def _bubble_dark_fraction(binary: np.ndarray, cx: int, cy: int, r: int) -> float:
+    """
+    Fraction of pixels inside circle (cx, cy, r) that are dark (value == 0).
+    """
+    img_h, img_w = binary.shape
+    mask = np.zeros((img_h, img_w), dtype=np.uint8)
     cv2.circle(mask, (cx, cy), r, 255, -1)
     total_px = cv2.countNonZero(mask)
     if total_px == 0:
         return 0.0
-    # In the binary: 0 = dark (ink/filled), 255 = white (paper)
-    # We want dark pixels → where binary_warped == 0 AND mask == 255
-    dark_px = int(np.sum((binary_warped == 0) & (mask == 255)))
+    dark_px = int(np.sum((binary == 0) & (mask == 255)))
     return dark_px / total_px
 
 
-def read_bubbles(binary_warped: np.ndarray, total_preguntas: int) -> dict:
+def read_bubbles(binary_warped: np.ndarray, circles_map: dict, total_preguntas: int) -> dict:
     """
-    Scan every bubble position and return a dict {question_number: answer_letter}.
-    answer_letter is "A", "B", "C" or None.
+    Read answers using the template circle positions.
+
+    Args:
+        binary_warped   : binarised, perspective-corrected student image
+        circles_map     : from TEMPLATE_CIRCLES
+        total_preguntas : how many questions to read (≤ 90)
+
+    Returns:
+        {"1": "A", "2": None, "3": "C", …}
     """
-    results = {}
+    results      = {}
     filled_count = 0
-    dark_fractions_log = []
+    sample_log   = []
 
     for q in range(1, total_preguntas + 1):
-        # Map question number → (col_index, row_index)
-        col_idx = (q - 1) // N_ROWS          # 0-based column
-        row_idx = (q - 1) % N_ROWS           # 0-based row within column
+        q_str = str(q)
+        bubbles = circles_map.get(q_str)
+        if not bubbles:
+            results[q_str] = None
+            continue
 
-        # Centre of the *first* option (A) for this question
-        base_x = int(FIRST_X + col_idx * COL_STEP)
-        base_y = int(FIRST_Y + row_idx * ROW_STEP)
+        fractions = {}
+        for opt, coords in bubbles.items():
+            if coords is None:
+                fractions[opt] = 0.0
+                continue
+            cx, cy, r = int(coords[0]), int(coords[1]), int(coords[2])
+            fractions[opt] = _bubble_dark_fraction(binary_warped, cx, cy, r)
 
-        fractions = []
-        for opt in range(N_OPTIONS):
-            cx = base_x + opt * OPTION_STEP
-            cy = base_y
-            frac = bubble_dark_fraction(binary_warped, cx, cy, BUBBLE_RADIUS)
-            fractions.append(frac)
-
-        best_opt = int(np.argmax(fractions))
+        best_opt  = max(fractions, key=fractions.get)
         best_frac = fractions[best_opt]
 
-        dark_fractions_log.append((q, fractions))
+        if q <= 5:
+            sample_log.append(f"  Q{q}: {fractions} → {best_opt}={best_frac:.3f}")
 
         if best_frac >= FILL_THRESHOLD:
-            answer = chr(ord("A") + best_opt)
-            results[str(q)] = answer
-            filled_count += 1
+            results[q_str] = best_opt
+            filled_count  += 1
         else:
-            results[str(q)] = None
+            results[q_str] = None
 
-    log.debug("Sample dark fractions (first 10): %s", dark_fractions_log[:10])
+    log.debug("Sample dark fractions:\n%s", "\n".join(sample_log))
     log.info("Filled bubbles: %d / %d", filled_count, total_preguntas)
     return results
 
@@ -292,30 +434,30 @@ def read_bubbles(binary_warped: np.ndarray, total_preguntas: int) -> dict:
 # Core OMR pipeline
 # ---------------------------------------------------------------------------
 def process_omr(img: np.ndarray, total_preguntas: int) -> dict:
+    if TEMPLATE_CIRCLES is None:
+        raise RuntimeError(
+            "No template loaded. Call POST /setup-template with the blank "
+            "template image before processing student sheets."
+        )
+
     # 1. Grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    log.debug("Grayscale OK")
 
-    # 2. Find corner markers directly on the grayscale image.
-    #    The new detector applies its own fixed-threshold binarisation
-    #    internally, so we do NOT pre-threshold here.
+    # 2. Detect corner markers
     corners = find_corner_markers(gray)
 
-    # 3. Gaussian blur + Otsu binarisation — used only for bubble reading
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    log.debug("Otsu threshold OK (bubble reading)")
+    # 3. Warp to template dimensions
+    warped_color = warp_to_template(img, corners)
 
-    # 4. Perspective correction
-    warped_color = warp_perspective(img, corners)
-    warped_gray  = cv2.cvtColor(warped_color, cv2.COLOR_BGR2GRAY)
-    _, warped_bin = cv2.threshold(warped_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    log.debug("Perspective warp OK")
+    # 4. Binarise warped image for bubble reading (Otsu on blurred gray)
+    warped_gray = cv2.cvtColor(warped_color, cv2.COLOR_BGR2GRAY)
+    blurred     = cv2.GaussianBlur(warped_gray, (5, 5), 0)
+    _, warped_bin = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    log.debug("Otsu threshold applied to warped image")
 
-    # 6. Read bubbles
-    respuestas = read_bubbles(warped_bin, total_preguntas)
+    # 5. Read bubbles at template positions
+    respuestas = read_bubbles(warped_bin, TEMPLATE_CIRCLES, total_preguntas)
 
-    # 7. Confidence: fraction of questions with a detected answer
     total_detectadas = sum(1 for v in respuestas.values() if v is not None)
     confianza = round(total_detectadas / total_preguntas, 4) if total_preguntas else 0.0
 
@@ -328,18 +470,110 @@ def process_omr(img: np.ndarray, total_preguntas: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Flask endpoint
+# Flask endpoints
 # ---------------------------------------------------------------------------
+
+@app.route("/setup-template", methods=["POST"])
+def setup_template():
+    """
+    Load a blank template image, detect all 270 bubble positions with
+    HoughCircles, and store them for use by /procesar.
+
+    Request body (JSON):
+        {
+          "imagen_base64": "<base64 image of the blank answer sheet>"
+        }
+
+    Response:
+        {
+          "ok": true,
+          "total_circles_detected": 270,
+          "template_dims": [2550, 3300],
+          "questions_mapped": 90,
+          "circles": {
+            "1":  {"A": [cx, cy, r], "B": [...], "C": [...]},
+            ...
+            "90": {...}
+          }
+        }
+    """
+    global TEMPLATE_CIRCLES, TEMPLATE_DIMS
+
+    log.info("POST /setup-template received")
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"ok": False, "error": "Body must be JSON"}), 400
+    if "imagen_base64" not in data:
+        return jsonify({"ok": False, "error": "Missing field: imagen_base64"}), 400
+
+    try:
+        img = decode_image(data["imagen_base64"])
+    except Exception as exc:
+        log.error("Template decode failed: %s", exc)
+        return jsonify({"ok": False, "error": f"Image decode error: {exc}"}), 422
+
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    try:
+        circles = _detect_template_circles(gray)
+    except RuntimeError as exc:
+        log.error("HoughCircles failed: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 422
+    except Exception as exc:
+        log.error("Unexpected error in circle detection:\n%s", traceback.format_exc())
+        return jsonify({"ok": False, "error": "Internal error", "detail": str(exc)}), 500
+
+    try:
+        q_map = _sort_circles_to_questions(circles)
+    except Exception as exc:
+        log.error("Circle sorting failed:\n%s", traceback.format_exc())
+        return jsonify({"ok": False, "error": "Circle sorting error", "detail": str(exc)}), 500
+
+    # Commit to global state
+    TEMPLATE_CIRCLES = q_map
+    TEMPLATE_DIMS    = (w, h)
+    _save_template_state()
+
+    log.info(
+        "Template loaded: %d circles → %d questions, dims=(%d, %d)",
+        len(circles), len(q_map), w, h,
+    )
+
+    return jsonify({
+        "ok":                    True,
+        "total_circles_detected": len(circles),
+        "template_dims":         [w, h],
+        "questions_mapped":      len(q_map),
+        "circles":               q_map,
+    }), 200
+
+
 @app.route("/procesar", methods=["POST"])
 def procesar():
+    """
+    Process a student answer sheet.
+
+    Request body (JSON):
+        {
+          "imagen_base64":  "<base64 student photo>",
+          "total_preguntas": 90          (optional, default 90)
+        }
+
+    Response:
+        {
+          "ok": true,
+          "respuestas": {"1": "A", "2": null, "3": "C", ...},
+          "total_detectadas": 87,
+          "confianza": 0.9667
+        }
+    """
     log.info("POST /procesar received")
 
     data = request.get_json(silent=True)
     if not data:
-        log.warning("Empty or non-JSON body")
         return jsonify({"ok": False, "error": "Body must be JSON"}), 400
-
-    # Validate required fields
     if "imagen_base64" not in data:
         return jsonify({"ok": False, "error": "Missing field: imagen_base64"}), 400
 
@@ -355,7 +589,10 @@ def procesar():
 
     try:
         result = process_omr(img, total_preguntas)
-        log.info("OMR OK — detectadas=%d confianza=%.4f", result["total_detectadas"], result["confianza"])
+        log.info(
+            "OMR OK — detectadas=%d confianza=%.4f",
+            result["total_detectadas"], result["confianza"],
+        )
         return jsonify(result), 200
     except RuntimeError as exc:
         log.error("OMR pipeline error: %s", exc)
@@ -365,25 +602,26 @@ def procesar():
         return jsonify({"ok": False, "error": "Internal server error", "detail": str(exc)}), 500
 
 
-# ---------------------------------------------------------------------------
-# Debug endpoint — contour counts per threshold, no full OMR
-# ---------------------------------------------------------------------------
 @app.route("/debug", methods=["GET", "POST"])
 def debug():
     """
-    Inspect how many contours and marker candidates are found at each
-    threshold without running the full OMR pipeline.
+    Diagnostic endpoint — returns per-threshold contour counts and HoughCircles
+    counts without running the full OMR pipeline.
 
-    Accepts JSON body (works with both GET and POST):
-        { "imagen_base64": "<base64 string>" }
+    Request body (JSON):
+        { "imagen_base64": "<base64 image>" }
 
-    Returns per-threshold breakdown plus basic image info:
+    Response:
         {
+          "ok": true,
           "image_shape": [h, w],
-          "thresholds": {
-            "50":  {"raw_contours": 312, "after_area": 8, "after_aspect": 6, "after_solidity": 4},
-            "80":  {...},
-            "100": {...}
+          "template_loaded": true,
+          "marker_thresholds": {
+            "50":  {"raw_contours": 18, "after_area": 5, "after_aspect": 4, "after_solidity": 4},
+            ...
+          },
+          "hough_attempts": {
+            "50": 270, "40": 270, ...
           }
         }
     """
@@ -396,64 +634,78 @@ def debug():
     try:
         img = decode_image(data["imagen_base64"])
     except Exception as exc:
-        log.error("Debug image decode failed: %s", exc)
         return jsonify({"ok": False, "error": f"Image decode error: {exc}"}), 422
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
-    threshold_results = {}
 
+    # --- Marker detection stats ---
+    marker_stats = {}
     for thresh_val in _MARKER_THRESHOLDS:
         _, binary_inv = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(binary_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _   = cv2.findContours(binary_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         raw = len(contours)
-
-        after_area = after_aspect = after_solidity = 0
+        aa = aas = sol = 0
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if not (_MARKER_AREA_MIN <= area <= _MARKER_AREA_MAX):
                 continue
-            after_area += 1
-
+            aa += 1
             bx, by, bw2, bh2 = cv2.boundingRect(cnt)
             aspect = bw2 / bh2 if bh2 > 0 else 0
             if not (0.5 < aspect < 2.0):
                 continue
-            after_aspect += 1
-
+            aas += 1
             hull = cv2.convexHull(cnt)
             hull_area = cv2.contourArea(hull)
-            if hull_area == 0:
-                continue
-            if (area / hull_area) < 0.85:
-                continue
-            after_solidity += 1
-
-        threshold_results[str(thresh_val)] = {
+            if hull_area and (area / hull_area) >= 0.85:
+                sol += 1
+        marker_stats[str(thresh_val)] = {
             "raw_contours": raw,
-            "after_area_filter": after_area,
-            "after_aspect_filter": after_aspect,
-            "after_solidity_filter": after_solidity,
+            "after_area_filter":     aa,
+            "after_aspect_filter":   aas,
+            "after_solidity_filter": sol,
         }
-        log.info(
-            "Debug thresh=%d: raw=%d area=%d aspect=%d solidity=%d",
-            thresh_val, raw, after_area, after_aspect, after_solidity,
+        log.info("Debug markers thresh=%d: raw=%d area=%d aspect=%d solid=%d",
+                 thresh_val, raw, aa, aas, sol)
+
+    # --- HoughCircles counts ---
+    px_per_mm = w / 215.9
+    r_est     = int(7.0  * px_per_mm)
+    min_dist  = int(14.0 * px_per_mm)
+    min_r     = max(4, int(r_est * 0.60))
+    max_r     = int(r_est * 1.40)
+    blurred   = cv2.GaussianBlur(gray, (9, 9), 2)
+    hough_counts = {}
+    for p2 in (50, 40, 30, 25, 20, 15):
+        raw = cv2.HoughCircles(
+            blurred, cv2.HOUGH_GRADIENT, dp=1,
+            minDist=min_dist, param1=50, param2=p2,
+            minRadius=min_r, maxRadius=max_r,
         )
+        hough_counts[str(p2)] = 0 if raw is None else int(raw.shape[1])
+    log.info("Debug HoughCircles counts: %s", hough_counts)
 
     return jsonify({
-        "ok": True,
-        "image_shape": [h, w],
+        "ok":              True,
+        "image_shape":     [h, w],
+        "template_loaded": TEMPLATE_CIRCLES is not None,
+        "template_dims":   list(TEMPLATE_DIMS) if TEMPLATE_DIMS else None,
         "marker_area_range": [_MARKER_AREA_MIN, _MARKER_AREA_MAX],
-        "thresholds": threshold_results,
+        "marker_thresholds": marker_stats,
+        "hough_attempts":  hough_counts,
     }), 200
 
 
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "evolvi-omr"}), 200
+    return jsonify({
+        "status":          "ok",
+        "service":         "evolvi-omr",
+        "template_loaded": TEMPLATE_CIRCLES is not None,
+        "template_dims":   list(TEMPLATE_DIMS) if TEMPLATE_DIMS else None,
+        "questions_ready": len(TEMPLATE_CIRCLES) if TEMPLATE_CIRCLES else 0,
+    }), 200
 
 
 # ---------------------------------------------------------------------------
