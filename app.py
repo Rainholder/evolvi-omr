@@ -74,8 +74,9 @@ _SHEET_COORDS_FILE = "sheet_coords.json"     # PDF-geometry coords (auto-loaded 
 
 # ORB feature matching template image
 _TEMPLATE_IMAGE_FILE = "template_image.png"
-_TEMPLATE_IMAGE: np.ndarray | None = None    # rendered reference image for ORB alignment
-_last_orb_viz:   np.ndarray | None = None    # last drawMatches output for /debug-visual
+_TEMPLATE_IMAGE:    np.ndarray | None = None  # rendered reference image for ORB alignment
+_last_orb_viz:      np.ndarray | None = None  # last drawMatches output for /debug-visual
+_COORDS_EXAM_CODE:  str | None        = None  # exam_code from the last loaded coords file
 
 # Standard Letter page at 300 DPI — matches generate_sheet coordinate space
 _LETTER_W_PX = 2550
@@ -141,10 +142,14 @@ def _load_sheet_coords_file(path: str) -> bool:
     Expected JSON structure:
         {"exam_code": "EV-ATR-JUN26", "coords": {"celular": {...}, "respuestas": {...}}}
 
-    On success: populates TEMPLATE_CIRCLES / TEMPLATE_DIMS / COORDS_SOURCE, returns True.
+    On success: populates TEMPLATE_CIRCLES / TEMPLATE_DIMS / COORDS_SOURCE /
+    _COORDS_EXAM_CODE, returns True.
     On failure: logs a warning, leaves globals unchanged, returns False.
+
+    NOTE: does NOT render the template image — caller is responsible for
+    calling _render_template_image(_COORDS_EXAM_CODE) when appropriate.
     """
-    global TEMPLATE_CIRCLES, TEMPLATE_DIMS, COORDS_SOURCE
+    global TEMPLATE_CIRCLES, TEMPLATE_DIMS, COORDS_SOURCE, _COORDS_EXAM_CODE
     if not os.path.exists(path):
         return False
     try:
@@ -154,21 +159,15 @@ def _load_sheet_coords_file(path: str) -> bool:
         coords     = data["coords"] if "coords" in data else data
         respuestas = coords["respuestas"]
         circles    = _sheet_respuestas_to_circles(respuestas)
-        TEMPLATE_CIRCLES = circles
-        TEMPLATE_DIMS    = (_LETTER_W_PX, _LETTER_H_PX)
-        COORDS_SOURCE    = "sheet_coords"
+        TEMPLATE_CIRCLES  = circles
+        TEMPLATE_DIMS     = (_LETTER_W_PX, _LETTER_H_PX)
+        COORDS_SOURCE     = "sheet_coords"
+        _COORDS_EXAM_CODE = data.get("exam_code")   # may be None for bare-format files
         r_sample = list(circles.values())[0]["A"][2]
         log.info(
-            "Sheet coords loaded from %s — %d questions, r=%d px, dims=%s",
-            path, len(circles), r_sample, TEMPLATE_DIMS,
+            "Sheet coords loaded from %s — %d questions, r=%d px, dims=%s, exam_code=%s",
+            path, len(circles), r_sample, TEMPLATE_DIMS, _COORDS_EXAM_CODE,
         )
-        # Try to populate _TEMPLATE_IMAGE for ORB alignment:
-        # 1. Load existing PNG from disk (fast, no poppler needed)
-        # 2. Render from PDF using pdf2image if exam_code is known
-        if not _load_template_image_file():
-            exam_code_in_file = data.get("exam_code")
-            if exam_code_in_file:
-                _render_template_image(exam_code_in_file)
         return True
     except Exception as exc:
         log.warning("Could not load sheet coords from %s: %s", path, exc)
@@ -237,19 +236,47 @@ def _bootstrap() -> None:
       1. template_state.json  (HoughCircles — highest positional accuracy)
       2. sheet_coords.json    (PDF-geometry — no template photo required)
 
-    Also loads template_image.png for ORB feature matching if available.
+    After loading coords the template image is always re-rendered from the PDF
+    in memory (not read from disk) so it is available for ORB alignment even
+    after an ephemeral-filesystem redeploy on Render.
     """
     if _load_template_state():
-        _load_template_image_file()
+        # HoughCircles state loaded; try to render template image if we know
+        # the exam_code from a previously saved sheet_coords.json.
+        _try_render_template_from_coords_file()
         return
     if _load_sheet_coords_file(_SHEET_COORDS_FILE):
+        # Coords loaded — immediately render the template image in memory.
+        if _COORDS_EXAM_CODE:
+            _render_template_image(_COORDS_EXAM_CODE)
+        else:
+            log.warning(
+                "sheet_coords.json has no exam_code — ORB template image unavailable. "
+                "Re-generate the sheet via GET /sheet/<exam_code>."
+            )
         return
     log.info(
-        "No coords loaded at startup. Call POST /setup-template or "
-        "GET /sheet/<exam_code> to generate sheet_coords.json."
+        "No coords loaded at startup. Call GET /sheet/<exam_code> to generate "
+        "sheet_coords.json and bootstrap the service."
     )
-    # Still try to load any previously rendered template image
-    _load_template_image_file()
+
+
+def _try_render_template_from_coords_file() -> None:
+    """
+    Read exam_code from sheet_coords.json (if present) and render the template
+    image for ORB alignment.  Called after HoughCircles state is loaded so ORB
+    is available as a fallback even when /setup-template coordinates are in use.
+    """
+    if not os.path.exists(_SHEET_COORDS_FILE):
+        return
+    try:
+        with open(_SHEET_COORDS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        exam_code = data.get("exam_code")
+        if exam_code:
+            _render_template_image(exam_code)
+    except Exception as exc:
+        log.warning("Could not read exam_code from %s for ORB render: %s", _SHEET_COORDS_FILE, exc)
 
 
 _bootstrap()
@@ -1347,11 +1374,15 @@ def get_sheet(exam_code: str):
         per_exam, _SHEET_COORDS_FILE,
     )
 
-    # Auto-load into memory so /procesar works immediately after /sheet
+    # Auto-load into memory so /procesar works immediately after /sheet.
+    # _load_sheet_coords_file also sets _COORDS_EXAM_CODE.
     if COORDS_SOURCE != "setup_template":
         _load_sheet_coords_file(per_exam)
 
-    # Render the template image for ORB alignment (overwrites any stale PNG)
+    # Always render the template image fresh (ephemeral FS on Render means
+    # we cannot rely on a PNG surviving across redeploys — keep it in memory).
+    global _COORDS_EXAM_CODE
+    _COORDS_EXAM_CODE = safe_code
     _render_template_image(safe_code)
 
     return send_file(
@@ -1419,12 +1450,14 @@ def get_coords(exam_code: str):
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
-        "status":           "ok",
-        "service":          "evolvi-omr",
-        "template_loaded":  TEMPLATE_CIRCLES is not None,
-        "source":           COORDS_SOURCE,
-        "questions_ready":  len(TEMPLATE_CIRCLES) if TEMPLATE_CIRCLES else 0,
-        "perspective_mode": LAST_PERSPECTIVE_MODE,
+        "status":                "ok",
+        "service":               "evolvi-omr",
+        "template_loaded":       TEMPLATE_CIRCLES is not None,
+        "source":                COORDS_SOURCE,
+        "exam_code":             _COORDS_EXAM_CODE,
+        "questions_ready":       len(TEMPLATE_CIRCLES) if TEMPLATE_CIRCLES else 0,
+        "template_image_loaded": _TEMPLATE_IMAGE is not None,
+        "perspective_mode":      LAST_PERSPECTIVE_MODE,
     }), 200
 
 
