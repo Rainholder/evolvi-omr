@@ -1,18 +1,23 @@
 """
 OMR (Optical Mark Recognition) microservice — template-matching edition.
 
-Architecture:
+Coordinate sources (in priority order):
   1. POST /setup-template  — send a blank template image; HoughCircles detects
-                             all 270 bubble positions ONCE and stores them in
-                             memory.  Must be called before /procesar.
-  2. POST /procesar        — send a student photo; the service aligns it to the
-                             template via corner markers + warpPerspective, then
-                             reads each bubble at the stored coordinates.
+                             all 270 bubble positions and stores them.
+                             Most accurate; required only once per deployment.
+  2. sheet_coords.json     — coordinates computed from the PDF geometry at
+                             300 DPI.  Loaded automatically on startup if
+                             template_state.json is absent.
+  3. {EXAM_CODE}_coords.json — per-exam variant; loaded on demand via the
+                               exam_code field in /procesar.
+
+POST /procesar accepts an optional exam_code field.  If provided (and
+/setup-template has not been called), it loads the matching coords file.
 
 Sheet layout (fixed):
   - 6 question-columns × 15 rows = 90 questions
   - 3 bubbles per question (A, B, C) left-to-right
-  - 4 solid black square corner markers at the grid corners
+  - 4 solid black square corner markers used for warpPerspective alignment
 """
 
 import base64
@@ -53,16 +58,40 @@ TOTAL_BUBBLES = N_COLS * N_ROWS * N_OPTIONS   # 270
 FILL_THRESHOLD = 0.18
 
 # ---------------------------------------------------------------------------
-# Global template state
-#   TEMPLATE_CIRCLES  : dict  {"1": {"A": [cx,cy,r], ...}, ..., "90": {...}}
-#   TEMPLATE_DIMS     : tuple (width_px, height_px) of the template image
-# Both are None until /setup-template is successfully called.
+# Global OMR state
+#   TEMPLATE_CIRCLES : dict  {"1": {"A": [cx,cy,r], ...}, ..., "90": {...}}
+#   TEMPLATE_DIMS    : tuple (width_px, height_px) of the coordinate space
+#   COORDS_SOURCE    : str   how the state was populated
 # ---------------------------------------------------------------------------
 TEMPLATE_CIRCLES: dict | None = None
 TEMPLATE_DIMS:    tuple | None = None
+COORDS_SOURCE:    str          = "none"   # "setup_template" | "sheet_coords" | "none"
 
-# Optional on-disk persistence — survives server restarts on Render.com.
-_STATE_FILE = "template_state.json"
+# On-disk state files
+_STATE_FILE        = "template_state.json"   # HoughCircles state (highest accuracy)
+_SHEET_COORDS_FILE = "sheet_coords.json"     # PDF-geometry coords (auto-loaded fallback)
+
+# Standard Letter page at 300 DPI — matches generate_sheet coordinate space
+_LETTER_W_PX = 2550
+_LETTER_H_PX = 3300
+
+
+def _sheet_respuestas_to_circles(respuestas: dict) -> dict:
+    """
+    Convert the respuestas section of a sheet_coords file to TEMPLATE_CIRCLES format.
+
+    Input : {"1": {"A": [cx_px, cy_px], ...}, ..., "90": {...}}
+    Output: {"1": {"A": [cx_px, cy_px, r_px], ...}, ...}
+
+    The radius is taken from generate_sheet constants (R_RESP in PDF points
+    converted to pixels at 300 DPI).
+    """
+    from generate_sheet import R_RESP, PT_PX
+    r_px = round(R_RESP * PT_PX)
+    return {
+        q: {opt: [c[0], c[1], r_px] for opt, c in opts.items()}
+        for q, opts in respuestas.items()
+    }
 
 
 def _save_template_state() -> None:
@@ -75,26 +104,83 @@ def _save_template_state() -> None:
         log.warning("Could not save template state: %s", exc)
 
 
-def _load_template_state() -> None:
-    """Load template state from disk if available."""
-    global TEMPLATE_CIRCLES, TEMPLATE_DIMS
+def _load_template_state() -> bool:
+    """
+    Load HoughCircles template state from template_state.json.
+    Returns True on success, False if the file is absent or unreadable.
+    """
+    global TEMPLATE_CIRCLES, TEMPLATE_DIMS, COORDS_SOURCE
     if not os.path.exists(_STATE_FILE):
-        return
+        return False
     try:
         with open(_STATE_FILE) as f:
             data = json.load(f)
         TEMPLATE_DIMS    = tuple(data["dims"])
         TEMPLATE_CIRCLES = data["circles"]
+        COORDS_SOURCE    = "setup_template"
         log.info(
             "Template state loaded from %s — %d questions, dims=%s",
             _STATE_FILE, len(TEMPLATE_CIRCLES), TEMPLATE_DIMS,
         )
+        return True
     except Exception as exc:
         log.warning("Could not load template state from disk: %s", exc)
+        return False
 
 
-# Load on startup
-_load_template_state()
+def _load_sheet_coords_file(path: str) -> bool:
+    """
+    Load bubble coordinates from a sheet_coords JSON file.
+
+    Expected JSON structure:
+        {"exam_code": "EV-ATR-JUN26", "coords": {"celular": {...}, "respuestas": {...}}}
+
+    On success: populates TEMPLATE_CIRCLES / TEMPLATE_DIMS / COORDS_SOURCE, returns True.
+    On failure: logs a warning, leaves globals unchanged, returns False.
+    """
+    global TEMPLATE_CIRCLES, TEMPLATE_DIMS, COORDS_SOURCE
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        # Support both wrapped {"exam_code":…, "coords":{…}} and bare {…} formats
+        coords     = data["coords"] if "coords" in data else data
+        respuestas = coords["respuestas"]
+        circles    = _sheet_respuestas_to_circles(respuestas)
+        TEMPLATE_CIRCLES = circles
+        TEMPLATE_DIMS    = (_LETTER_W_PX, _LETTER_H_PX)
+        COORDS_SOURCE    = "sheet_coords"
+        r_sample = list(circles.values())[0]["A"][2]
+        log.info(
+            "Sheet coords loaded from %s — %d questions, r=%d px, dims=%s",
+            path, len(circles), r_sample, TEMPLATE_DIMS,
+        )
+        return True
+    except Exception as exc:
+        log.warning("Could not load sheet coords from %s: %s", path, exc)
+        return False
+
+
+def _bootstrap() -> None:
+    """
+    Populate OMR state at server startup.
+
+    Priority:
+      1. template_state.json  (HoughCircles — highest positional accuracy)
+      2. sheet_coords.json    (PDF-geometry — no template photo required)
+    """
+    if _load_template_state():
+        return
+    if _load_sheet_coords_file(_SHEET_COORDS_FILE):
+        return
+    log.info(
+        "No coords loaded at startup. Call POST /setup-template or "
+        "GET /sheet/<exam_code> to generate sheet_coords.json."
+    )
+
+
+_bootstrap()
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +586,7 @@ def setup_template():
           }
         }
     """
-    global TEMPLATE_CIRCLES, TEMPLATE_DIMS
+    global TEMPLATE_CIRCLES, TEMPLATE_DIMS, COORDS_SOURCE
 
     log.info("POST /setup-template received")
 
@@ -537,6 +623,7 @@ def setup_template():
     # Commit to global state
     TEMPLATE_CIRCLES = q_map
     TEMPLATE_DIMS    = (w, h)
+    COORDS_SOURCE    = "setup_template"
     _save_template_state()
 
     log.info(
@@ -560,16 +647,23 @@ def procesar():
 
     Request body (JSON):
         {
-          "imagen_base64":  "<base64 student photo>",
-          "total_preguntas": 90          (optional, default 90)
+          "imagen_base64":   "<base64 student photo>",
+          "total_preguntas":  90,            (optional, default 90)
+          "exam_code":       "EV-ATR-JUN26"  (optional)
         }
+
+    When exam_code is provided and the current source is NOT setup_template,
+    the service tries to load {EXAM_CODE}_coords.json first, then falls back
+    to sheet_coords.json.  If /setup-template was called its HoughCircles state
+    is always used regardless of exam_code.
 
     Response:
         {
           "ok": true,
           "respuestas": {"1": "A", "2": null, "3": "C", ...},
           "total_detectadas": 87,
-          "confianza": 0.9667
+          "confianza": 0.9667,
+          "coords_source": "sheet_coords"
         }
     """
     log.info("POST /procesar received")
@@ -584,6 +678,20 @@ def procesar():
     if not isinstance(total_preguntas, int) or not (1 <= total_preguntas <= 300):
         return jsonify({"ok": False, "error": "total_preguntas must be an integer 1–300"}), 400
 
+    # Load per-exam coords on demand (only when not using HoughCircles state).
+    exam_code = data.get("exam_code")
+    if exam_code and COORDS_SOURCE != "setup_template":
+        code_safe = exam_code.upper().replace("/", "-").replace(" ", "_")
+        for candidate in (f"{code_safe}_coords.json", _SHEET_COORDS_FILE):
+            if _load_sheet_coords_file(candidate):
+                log.info("Loaded coords for exam %s from %s", exam_code, candidate)
+                break
+        else:
+            log.warning(
+                "No coords file found for exam_code=%s; using current state (%s)",
+                exam_code, COORDS_SOURCE,
+            )
+
     try:
         img = decode_image(data["imagen_base64"])
     except Exception as exc:
@@ -592,9 +700,10 @@ def procesar():
 
     try:
         result = process_omr(img, total_preguntas)
+        result["coords_source"] = COORDS_SOURCE
         log.info(
-            "OMR OK — detectadas=%d confianza=%.4f",
-            result["total_detectadas"], result["confianza"],
+            "OMR OK — detectadas=%d confianza=%.4f source=%s",
+            result["total_detectadas"], result["confianza"], COORDS_SOURCE,
         )
         return jsonify(result), 200
     except RuntimeError as exc:
@@ -723,17 +832,27 @@ def get_sheet(exam_code: str):
         log.error("Sheet generation failed: %s\n%s", exc, traceback.format_exc())
         return jsonify({"ok": False, "error": str(exc)}), 500
 
-    # Persist coords so the OMR pipeline can load them directly
-    coords_path = "sheet_coords.json"
-    try:
-        with open(coords_path, "w") as f:
-            json.dump({"exam_code": exam_code.upper(), "coords": sheet_coords}, f)
-        log.info("Saved coords (%d resp + %d cel) to %s",
-                 len(sheet_coords["respuestas"]), len(sheet_coords["celular"]), coords_path)
-    except Exception as exc:
-        log.warning("Could not save sheet_coords.json: %s", exc)
+    safe_code   = exam_code.upper().replace("/", "-").replace(" ", "_")
+    per_exam    = f"{safe_code}_coords.json"
+    coords_data = {"exam_code": exam_code.upper(), "coords": sheet_coords}
 
-    safe_code = exam_code.upper().replace("/", "-").replace(" ", "_")
+    # Persist coords — per-exam file and generic fallback
+    for coords_path in (per_exam, _SHEET_COORDS_FILE):
+        try:
+            with open(coords_path, "w", encoding="utf-8") as f:
+                json.dump(coords_data, f)
+        except Exception as exc:
+            log.warning("Could not save %s: %s", coords_path, exc)
+
+    log.info(
+        "Saved coords (%d resp + %d cel) to %s and %s",
+        len(sheet_coords["respuestas"]), len(sheet_coords["celular"]),
+        per_exam, _SHEET_COORDS_FILE,
+    )
+
+    # Auto-load into memory so /procesar works immediately after /sheet
+    if COORDS_SOURCE != "setup_template":
+        _load_sheet_coords_file(per_exam)
     return send_file(
         io.BytesIO(pdf_bytes),
         mimetype="application/pdf",
@@ -802,7 +921,7 @@ def health():
         "status":          "ok",
         "service":         "evolvi-omr",
         "template_loaded": TEMPLATE_CIRCLES is not None,
-        "template_dims":   list(TEMPLATE_DIMS) if TEMPLATE_DIMS else None,
+        "source":          COORDS_SOURCE,
         "questions_ready": len(TEMPLATE_CIRCLES) if TEMPLATE_CIRCLES else 0,
     }), 200
 
