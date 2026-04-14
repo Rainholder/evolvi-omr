@@ -137,7 +137,7 @@ Y_CEL_MARKER_TOP = MARGIN                      # = 20 pt — TL/TR celular marke
 Y_CEL_LABEL      = 33    # "CELULAR" text baseline
 Y_CEL_SQ_TOP     = 38    # digit-input squares: top edge
 Y_CEL_SQ_BOT     = Y_CEL_SQ_TOP + CEL_SQ_SIZE  # = 60 pt
-Y_CEL_ROW0       = 68    # first bubble-row centre (digit 0)
+Y_CEL_ROW0       = 70    # first bubble-row centre (digit 0)
 #   Last row centre   : Y_CEL_ROW0 + 9×20 = 248 pt
 #   Last bubble bottom: 248 + 8    = 256 pt
 Y_CEL_MARKER_BOT = 260   # BL/BR celular markers (span 260–268 pt from top)
@@ -175,7 +175,7 @@ INSTRUCTIONS = (
 # ---------------------------------------------------------------------------
 Y_SEPARATOR       = 290  # horizontal separator line (must stay clear)
 Y_RESP_MARKER_TOP = 290  # TL/TR respuestas markers (span 290–298 pt from top)
-Y_RESP_LABEL      = 298  # "RESPUESTAS" label baseline — drawn at x=30 to clear TL marker
+Y_RESP_LABEL      = 265  # "RESPUESTAS" label baseline — drawn at x=30 to clear TL marker
 Y_RESP_HDRS       = 310  # A / B / C column-header baseline
 Y_RESP_ROW0       = 320  # first question-row bubble centre
 
