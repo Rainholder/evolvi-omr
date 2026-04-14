@@ -605,21 +605,47 @@ def read_bubbles(binary_warped: np.ndarray, circles_map: dict, total_preguntas: 
 
 
 # ---------------------------------------------------------------------------
+# Perspective correction pipeline (shared by /procesar and /debug-visual)
+# ---------------------------------------------------------------------------
+def _run_perspective_correction(
+    img: np.ndarray, gray: np.ndarray
+) -> tuple[np.ndarray, "np.ndarray | None", str]:
+    """
+    Try the 3-stage perspective correction pipeline.
+
+    Returns:
+        warped_color : BGR image aligned to TEMPLATE_DIMS
+        corners      : (4, 2) float32 source corners in the ORIGINAL image space,
+                       or None when resize_only was used
+        mode         : "markers" | "edge_detection" | "resize_only"
+    """
+    # Stage 1: solid black corner markers
+    try:
+        corners = find_corner_markers(gray)
+        warped  = warp_to_template(img, corners)
+        log.info("Perspective: corner markers -> warpPerspective")
+        return warped, corners, "markers"
+    except RuntimeError as exc:
+        log.warning("Corner markers failed (%s) — trying edge detection", exc)
+
+    # Stage 2: Canny paper-edge detection
+    corners = _find_page_corners_by_edges(gray)
+    if corners is not None:
+        warped = warp_to_template(img, corners)
+        log.info("Perspective: edge detection -> warpPerspective")
+        return warped, corners, "edge_detection"
+    log.warning("Edge detection also failed — using resize fallback")
+
+    # Stage 3: simple resize
+    return _warp_by_resize(img), None, "resize_only"
+
+
+# ---------------------------------------------------------------------------
 # Core OMR pipeline
 # ---------------------------------------------------------------------------
 def process_omr(img: np.ndarray, total_preguntas: int) -> dict:
     """
     Full OMR pipeline with a 3-stage perspective correction fallback.
-
-    Stage 1 — Corner markers:
-        Detect the 4 solid black square corner markers and warpPerspective.
-    Stage 2 — Edge detection:
-        If marker detection fails, locate the paper boundary via Canny edges
-        and warpPerspective using the detected quadrilateral corners.
-    Stage 3 — Resize only:
-        If edge detection also fails, scale the image directly to TEMPLATE_DIMS
-        assuming the photo is already roughly frontal.
-
     The active stage is recorded in LAST_PERSPECTIVE_MODE.
     """
     global LAST_PERSPECTIVE_MODE
@@ -629,42 +655,14 @@ def process_omr(img: np.ndarray, total_preguntas: int) -> dict:
             "No coords loaded. Call POST /setup-template or GET /sheet/<exam_code> first."
         )
 
-    # ── 1. Grayscale (shared across all stages) ──────────────────────────────
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray                              = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    warped_color, _corners, mode      = _run_perspective_correction(img, gray)
+    LAST_PERSPECTIVE_MODE             = mode
 
-    # ── Stage 1: corner markers ───────────────────────────────────────────────
-    warped_color     = None
-    perspective_mode = "markers"
-    try:
-        corners      = find_corner_markers(gray)
-        warped_color = warp_to_template(img, corners)
-        log.info("Perspective correction: corner markers")
-    except RuntimeError as exc:
-        log.warning("Corner markers failed (%s) — trying edge detection", exc)
-
-    # ── Stage 2: Canny paper-edge detection ───────────────────────────────────
-    if warped_color is None:
-        corners = _find_page_corners_by_edges(gray)
-        if corners is not None:
-            warped_color     = warp_to_template(img, corners)
-            perspective_mode = "edge_detection"
-            log.info("Perspective correction: edge detection")
-        else:
-            log.warning("Edge detection failed — falling back to resize only")
-
-    # ── Stage 3: resize only ──────────────────────────────────────────────────
-    if warped_color is None:
-        warped_color     = _warp_by_resize(img)
-        perspective_mode = "resize_only"
-
-    LAST_PERSPECTIVE_MODE = perspective_mode
-
-    # ── Binarise (Otsu on blurred gray) ──────────────────────────────────────
     warped_gray = cv2.cvtColor(warped_color, cv2.COLOR_BGR2GRAY)
     blurred     = cv2.GaussianBlur(warped_gray, (5, 5), 0)
     _, warped_bin = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # ── Read bubbles ──────────────────────────────────────────────────────────
     respuestas       = read_bubbles(warped_bin, TEMPLATE_CIRCLES, total_preguntas)
     total_detectadas = sum(1 for v in respuestas.values() if v is not None)
     confianza        = round(total_detectadas / total_preguntas, 4) if total_preguntas else 0.0
@@ -674,7 +672,7 @@ def process_omr(img: np.ndarray, total_preguntas: int) -> dict:
         "respuestas":       respuestas,
         "total_detectadas": total_detectadas,
         "confianza":        confianza,
-        "perspective_mode": perspective_mode,
+        "perspective_mode": mode,
     }
 
 
@@ -832,6 +830,171 @@ def procesar():
     except Exception as exc:
         log.error("Unexpected error:\n%s", traceback.format_exc())
         return jsonify({"ok": False, "error": "Internal server error", "detail": str(exc)}), 500
+
+
+@app.route("/debug-visual", methods=["POST"])
+def debug_visual():
+    """
+    Visual debugger — runs the full OMR pipeline and returns annotated images
+    showing exactly where the algorithm is searching for bubbles.
+
+    Request body (JSON):
+        {
+          "imagen_base64":   "<base64 photo>",
+          "exam_code":       "EV-ATR-JUN26",   (optional)
+          "total_preguntas":  90               (optional, default 90)
+        }
+
+    Response:
+        {
+          "ok": true,
+          "perspective_mode": "markers",
+          "total_detectadas": 45,
+          "confianza": 0.50,
+          "imagen_procesada_base64": "data:image/jpeg;base64,…",
+              // Warped/aligned image with:
+              //   BLUE  filled circles  — 4 warp-anchor corner points
+              //   RED   hollow circles  — every bubble lookup position
+              //   GREEN filled circles  — bubbles detected as marked
+          "imagen_perspectiva_base64": "data:image/jpeg;base64,…"
+              // Original photo with blue polygon showing the detected
+              // paper boundary (absent when mode is resize_only)
+        }
+    """
+    log.info("POST /debug-visual received")
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"ok": False, "error": "Body must be JSON"}), 400
+    if "imagen_base64" not in data:
+        return jsonify({"ok": False, "error": "Missing field: imagen_base64"}), 400
+
+    total_preguntas = data.get("total_preguntas", 90)
+    if not isinstance(total_preguntas, int) or not (1 <= total_preguntas <= 300):
+        return jsonify({"ok": False, "error": "total_preguntas must be an integer 1-300"}), 400
+
+    # Load per-exam coords if needed (same logic as /procesar)
+    exam_code = data.get("exam_code")
+    if exam_code and COORDS_SOURCE != "setup_template":
+        code_safe = exam_code.upper().replace("/", "-").replace(" ", "_")
+        for candidate in (f"{code_safe}_coords.json", _SHEET_COORDS_FILE):
+            if _load_sheet_coords_file(candidate):
+                break
+
+    if TEMPLATE_CIRCLES is None:
+        return jsonify({
+            "ok": False,
+            "error": "No coords loaded. Call GET /sheet/<exam_code> or POST /setup-template first.",
+        }), 422
+
+    try:
+        img = decode_image(data["imagen_base64"])
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Image decode error: {exc}"}), 422
+
+    try:
+        # ── Run the perspective + OMR pipeline ────────────────────────────────
+        gray                         = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        warped_color, corners, mode  = _run_perspective_correction(img, gray)
+        global LAST_PERSPECTIVE_MODE
+        LAST_PERSPECTIVE_MODE        = mode
+
+        warped_gray = cv2.cvtColor(warped_color, cv2.COLOR_BGR2GRAY)
+        blurred     = cv2.GaussianBlur(warped_gray, (5, 5), 0)
+        _, warped_bin = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        respuestas = read_bubbles(warped_bin, TEMPLATE_CIRCLES, total_preguntas)
+
+        total_det  = sum(1 for v in respuestas.values() if v is not None)
+        confianza  = round(total_det / total_preguntas, 4) if total_preguntas else 0.0
+
+        # ── Build output scale (cap long side at 1200 px for fast transfer) ──
+        tw, th    = TEMPLATE_DIMS
+        MAX_PX    = 1200
+        sc        = min(1.0, MAX_PX / max(tw, th))
+        vis_w     = int(tw * sc)
+        vis_h     = int(th * sc)
+        r_min     = 3
+
+        # ── Annotate the PROCESSED (warped) image ────────────────────────────
+        vis = cv2.resize(warped_color, (vis_w, vis_h), interpolation=cv2.INTER_AREA)
+
+        # Blue filled circles at the 4 warp-anchor corners of the output canvas
+        corner_r = max(r_min, int(18 * sc))
+        for cx, cy in [
+            (corner_r,        corner_r),
+            (vis_w - corner_r, corner_r),
+            (vis_w - corner_r, vis_h - corner_r),
+            (corner_r,        vis_h - corner_r),
+        ]:
+            cv2.circle(vis, (cx, cy), corner_r,     (255, 80, 0), -1)
+            cv2.circle(vis, (cx, cy), corner_r + 2, (255, 255, 255), 2)
+
+        # Batch-project all bubble positions at the output scale
+        # (direct scale: warped coords → display coords)
+        for q_str, opts in TEMPLATE_CIRCLES.items():
+            answer = respuestas.get(q_str)
+            for opt, coords in opts.items():
+                cx = int(coords[0] * sc)
+                cy = int(coords[1] * sc)
+                r  = max(r_min, int(coords[2] * sc))
+                if answer == opt:
+                    cv2.circle(vis, (cx, cy), r,     (30, 210, 30), -1)   # green filled
+                    cv2.circle(vis, (cx, cy), r + 1, (10, 140, 10), 1)
+                else:
+                    cv2.circle(vis, (cx, cy), r, (30, 30, 220), 1)        # red hollow
+
+        # Mode + stats label
+        label = f"{mode} | {total_det}/{total_preguntas} detectados"
+        cv2.putText(vis, label, (10, vis_h - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2, cv2.LINE_AA)
+
+        _, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        b64_proc = "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
+
+        # ── Annotate the ORIGINAL image with perspective corners ──────────────
+        b64_persp = None
+        if corners is not None:
+            orig_sc = min(1.0, MAX_PX / max(img.shape[1], img.shape[0]))
+            vis_orig = cv2.resize(img.copy(),
+                                  (int(img.shape[1] * orig_sc), int(img.shape[0] * orig_sc)),
+                                  interpolation=cv2.INTER_AREA)
+            sc_corners = (corners * orig_sc).astype(np.int32)
+
+            # Blue polygon connecting the detected corners
+            cv2.polylines(vis_orig, [sc_corners.reshape(-1, 1, 2)], True, (255, 80, 0), 2)
+            for i, pt in enumerate(sc_corners):
+                cv2.circle(vis_orig, tuple(pt), 10,  (255, 80, 0), -1)
+                cv2.circle(vis_orig, tuple(pt), 12,  (255, 255, 255), 2)
+                label_corner = ["TL", "TR", "BR", "BL"][i]
+                cv2.putText(vis_orig, label_corner,
+                            (int(pt[0]) + 14, int(pt[1]) + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 3, cv2.LINE_AA)
+                cv2.putText(vis_orig, label_corner,
+                            (int(pt[0]) + 14, int(pt[1]) + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 80, 0), 1, cv2.LINE_AA)
+
+            cv2.putText(vis_orig, mode,
+                        (10, vis_orig.shape[0] - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2, cv2.LINE_AA)
+
+            _, buf2 = cv2.imencode(".jpg", vis_orig, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            b64_persp = "data:image/jpeg;base64," + base64.b64encode(buf2).decode("ascii")
+
+        result = {
+            "ok":                      True,
+            "perspective_mode":        mode,
+            "total_detectadas":        total_det,
+            "confianza":               confianza,
+            "imagen_procesada_base64": b64_proc,
+        }
+        if b64_persp:
+            result["imagen_perspectiva_base64"] = b64_persp
+
+        return jsonify(result), 200
+
+    except Exception as exc:
+        log.error("debug-visual error:\n%s", traceback.format_exc())
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/debug", methods=["GET", "POST"])
