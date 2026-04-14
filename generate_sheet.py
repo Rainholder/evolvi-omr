@@ -124,11 +124,11 @@ N_CEL_ROWS  = 10       # digit values 0–9
 
 CEL_SQ_SIZE = 22       # pt — each digit-input square (width = height)
 # 10 squares × 22 pt = 220 pt, centred in 247 pt right column
-_CEL_SQ_OFFSET = (RIGHT_X_END - RIGHT_X - N_CEL_COLS * CEL_SQ_SIZE) // 2  # = 13 pt
-CEL_SQ_X0 = RIGHT_X + _CEL_SQ_OFFSET          # = 358 pt — left edge of first square
+_CEL_SQ_OFFSET = (RIGHT_X_END - RIGHT_X - N_CEL_COLS * CEL_SQ_SIZE) / 2.0  # = 13.5 pt
+CEL_SQ_X0 = RIGHT_X + _CEL_SQ_OFFSET          # = 358.5 pt — left edge of first square
 
 R_CEL        = 8    # pt radius (diameter 16 pt — as spec)
-CEL_CX0      = CEL_SQ_X0 + CEL_SQ_SIZE // 2   # = 369 pt — centre of first bubble column
+CEL_CX0      = CEL_SQ_X0 + CEL_SQ_SIZE / 2.0  # = 369.5 pt — centre of first bubble column
 CEL_COL_STEP = CEL_SQ_SIZE                     # = 22 pt — horizontal centre-to-centre
 CEL_ROW_STEP = 20                              # pt — vertical centre-to-centre
 
@@ -173,11 +173,11 @@ INSTRUCTIONS = (
 # ---------------------------------------------------------------------------
 # Separator & RESPUESTAS section
 # ---------------------------------------------------------------------------
-Y_SEPARATOR      = 272   # horizontal separator line
-Y_RESP_MARKER_TOP = 276  # TL/TR respuestas markers (span 276–284 pt from top)
-Y_RESP_LABEL     = 292   # "RESPUESTAS" label baseline (11 pt bold)
-Y_RESP_HDRS      = 305   # A / B / C column-header baseline
-Y_RESP_ROW0      = 315   # first question-row bubble centre
+Y_SEPARATOR       = 285  # horizontal separator line
+Y_RESP_MARKER_TOP = 285  # TL/TR respuestas markers (span 285–293 pt from top)
+Y_RESP_LABEL      = 295  # "RESPUESTAS" label baseline (11 pt bold; 10 pt below separator)
+Y_RESP_HDRS       = 305  # A / B / C column-header baseline
+Y_RESP_ROW0       = 315  # first question-row bubble centre
 
 N_COLS    = 6
 N_ROWS    = 15
@@ -188,7 +188,7 @@ QROW_STEP = 19    # pt vertical centre-to-centre between questions (as spec)
 #   Last row centre   : Y_RESP_ROW0 + 14 × 19 = 581 pt from top
 #   Last bubble bottom: 581 + 8 = 589 pt from top
 Y_RESP_MARKER_BOT = 593  # BL/BR respuestas markers (span 593–601 pt from top)
-Y_FOOTER          = 610  # footer text baseline
+Y_FOOTER          = 772  # footer text baseline (PAGE_H − MARGIN = 792 − 20)
 
 # Respuestas column geometry
 # Markers at x=20 (TL) right edge=28 pt, and x=584 (TR) left edge.
@@ -309,6 +309,23 @@ def _bubble(c, cx: float, y_from_top: float, r: float,
         c.setFont("Helvetica", font_size)
         c.setFillColor(colors.Color(0.70, 0.70, 0.70))
         c.drawCentredString(cx, cy_pdf - font_size * 0.36, label)
+
+
+def _count_lines(c, text: str, max_width: float, font: str, size: float) -> int:
+    """Return the number of wrapped lines without drawing anything."""
+    words  = text.split()
+    count  = 0
+    w_used = 0.0
+    for word in words:
+        w = c.stringWidth(word + " ", font, size)
+        if w_used + w > max_width and w_used > 0:
+            count  += 1
+            w_used  = w
+        else:
+            w_used += w
+    if w_used > 0:
+        count += 1
+    return count
 
 
 def _wrap_text(c, text: str, x: float, y_from_top: float,
@@ -432,8 +449,17 @@ def build_sheet(exam_code: str) -> tuple[bytes, dict]:
     c.setFillColor(colors.black)
     c.drawString(lx, _y(Y_INST_LBL), "INSTRUCCIONES:")
 
+    _INST_FONT = "Helvetica"
+    _INST_LINE_H = 9.0
+    _LEFT_COL_BOTTOM = 275   # max y the left column may reach (pt from top)
+    inst_size = 6.5
+    n_inst_lines = _count_lines(c, INSTRUCTIONS, lw, _INST_FONT, inst_size)
+    if Y_INST_TEXT + n_inst_lines * _INST_LINE_H > _LEFT_COL_BOTTOM:
+        inst_size    = 6.0
+        n_inst_lines = _count_lines(c, INSTRUCTIONS, lw, _INST_FONT, inst_size)
+
     c.setFillColor(colors.Color(0.15, 0.15, 0.15))
-    _wrap_text(c, INSTRUCTIONS, lx, Y_INST_TEXT, lw, "Helvetica", 6.5, 9.0)
+    _wrap_text(c, INSTRUCTIONS, lx, Y_INST_TEXT, lw, _INST_FONT, inst_size, _INST_LINE_H)
 
     # =========================================================================
     # SEPARATOR LINE
@@ -501,6 +527,33 @@ def build_sheet(exam_code: str) -> tuple[bytes, dict]:
     c.save()
 
     sheet_coords = compute_sheet_coords()
+
+    # ── Layout verification (printed once per build call) ─────────────────
+    _last_cel_row_y   = Y_CEL_ROW0 + (N_CEL_ROWS - 1) * CEL_ROW_STEP
+    _last_resp_row_y  = Y_RESP_ROW0 + (N_ROWS - 1) * QROW_STEP
+    print("=== Layout Y positions (pt from page top) ===")
+    print(f"  Celular TL/TR markers : {Y_CEL_MARKER_TOP} – {Y_CEL_MARKER_TOP + MARKER}")
+    print(f"  Celular label         : {Y_CEL_LABEL}")
+    print(f"  Digit squares         : {Y_CEL_SQ_TOP} – {Y_CEL_SQ_BOT}")
+    print(f"  Celular row 0 centre  : {Y_CEL_ROW0}")
+    print(f"  Celular row 9 centre  : {_last_cel_row_y}")
+    print(f"  Celular BL/BR markers : {Y_CEL_MARKER_BOT} – {Y_CEL_MARKER_BOT + MARKER}")
+    print(f"  Top section ends at   : {Y_CEL_MARKER_BOT + MARKER}  (limit 280)")
+    print(f"  Instructions text end : {Y_INST_TEXT + n_inst_lines * _INST_LINE_H:.0f}"
+          f"  (font {inst_size}pt, {n_inst_lines} lines, limit 275)")
+    print(f"  Separator             : {Y_SEPARATOR}")
+    print(f"  Resp TL/TR markers    : {Y_RESP_MARKER_TOP} – {Y_RESP_MARKER_TOP + MARKER}")
+    print(f"  RESPUESTAS label      : {Y_RESP_LABEL}")
+    print(f"  A/B/C headers         : {Y_RESP_HDRS}")
+    print(f"  First resp row centre : {Y_RESP_ROW0}")
+    print(f"  Last  resp row centre : {_last_resp_row_y}")
+    print(f"  Last  resp row bottom : {_last_resp_row_y + R_RESP}")
+    print(f"  Resp BL/BR markers    : {Y_RESP_MARKER_BOT} – {Y_RESP_MARKER_BOT + MARKER}")
+    print(f"  Footer baseline       : {Y_FOOTER}  (page bottom 792)")
+    print(f"  Celular sq X0         : {CEL_SQ_X0:.1f}  (first sq centre {CEL_CX0:.1f})")
+    print(f"  Margin check X        : left={LEFT_X}  right_end={RIGHT_X_END}  (limits 20–592)")
+    print("=============================================")
+
     log.info(
         "Sheet built: code=%s  resp_bubbles=%d  cel_bubbles=%d  pdf=%d bytes",
         info["code"],
@@ -528,5 +581,5 @@ if __name__ == "__main__":
 
     n_resp = len(coords["respuestas"])
     n_cel  = sum(len(v) for v in coords["celular"].values())
-    print(f"PDF  → {out_pdf}  ({len(pdf_bytes):,} bytes)")
-    print(f"JSON → {out_json}  ({n_resp} preguntas, {n_resp*3} resp bubbles, {n_cel} cel bubbles)")
+    print(f"PDF  -> {out_pdf}  ({len(pdf_bytes):,} bytes)")
+    print(f"JSON -> {out_json}  ({n_resp} preguntas, {n_resp*3} resp bubbles, {n_cel} cel bubbles)")
