@@ -1683,6 +1683,52 @@ def get_coords(exam_code: str):
     }), 200
 
 
+@app.route("/sheet-preview/<exam_code>", methods=["GET"])
+def sheet_preview(exam_code: str):
+    """
+    Return a PNG render of the answer-sheet template for exam_code.
+
+    Used by the mobile app to show a semi-transparent overlay inside the
+    camera guide frame so the student can align the physical sheet.
+
+    Priority:
+      1. Use _TEMPLATE_IMAGE already in memory (fast path).
+      2. Render on the fly from the PDF (slow path, ~1-2 s).
+    """
+    global _TEMPLATE_IMAGE, _COORDS_EXAM_CODE
+
+    log.info("GET /sheet-preview/%s", exam_code)
+
+    # -- fast path: in-memory image matches requested code ----------------
+    if _TEMPLATE_IMAGE is not None and _COORDS_EXAM_CODE == exam_code:
+        img_to_serve = _TEMPLATE_IMAGE
+    else:
+        # -- slow path: render from PDF on the fly -----------------------
+        try:
+            from pdf2image import convert_from_bytes  # noqa: PLC0415
+            pdf_bytes, _ = build_sheet(exam_code)
+            pages = convert_from_bytes(pdf_bytes, dpi=150)
+            if not pages:
+                return jsonify({"ok": False, "error": "pdf2image returned no pages"}), 500
+            img_np = np.array(pages[0].convert("RGB"))
+            img_to_serve = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        except Exception as exc:
+            log.error("sheet-preview render failed for %s: %s", exam_code, exc)
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    # -- encode to PNG and stream ----------------------------------------
+    ok, buf = cv2.imencode(".png", img_to_serve)
+    if not ok:
+        return jsonify({"ok": False, "error": "PNG encoding failed"}), 500
+
+    from flask import Response
+    return Response(
+        buf.tobytes(),
+        mimetype="image/png",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
