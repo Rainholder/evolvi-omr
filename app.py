@@ -78,8 +78,9 @@ _TEMPLATE_IMAGE:    np.ndarray | None = None  # rendered reference image for ORB
 _last_orb_viz:      np.ndarray | None = None  # last drawMatches output for /debug-visual
 _COORDS_EXAM_CODE:  str | None        = None  # exam_code from the last loaded coords file
 
-# 8-marker detection
-# {"celular_TL":[x,y], "celular_TR":…, …, "resp_BR":[x,y]} — pixel space (template dims)
+# 12-marker detection
+# {"corner_TL":[x,y], …} — pixel space (template dims)
+# Internally always stored as [x, y] lists; JSON may contain richer dicts with size/pt metadata.
 MARKER_TEMPLATE_POSITIONS: dict | None = None
 _last_marker_result:       dict | None = None  # last find_all_markers() output for /debug-visual
 
@@ -169,14 +170,23 @@ def _load_sheet_coords_file(path: str) -> bool:
         TEMPLATE_DIMS     = (_LETTER_W_PX, _LETTER_H_PX)
         COORDS_SOURCE     = "sheet_coords"
         _COORDS_EXAM_CODE = data.get("exam_code")   # may be None for bare-format files
-        # Load 8-marker template positions if present (added by compute_sheet_coords)
+        # Load marker template positions if present.
+        # Supports both formats:
+        #   old: {"name": [x, y]}
+        #   new: {"name": {"x": px, "y": px, "size": "large", "pt": 16}}
         raw_markers = coords.get("markers")
         if raw_markers:
-            MARKER_TEMPLATE_POSITIONS = {k: [int(v[0]), int(v[1])] for k, v in raw_markers.items()}
+            parsed: dict = {}
+            for k, v in raw_markers.items():
+                if isinstance(v, dict):
+                    parsed[k] = [int(v["x"]), int(v["y"])]
+                else:
+                    parsed[k] = [int(v[0]), int(v[1])]
+            MARKER_TEMPLATE_POSITIONS = parsed
             log.info("Marker template positions loaded: %d markers", len(MARKER_TEMPLATE_POSITIONS))
         else:
             MARKER_TEMPLATE_POSITIONS = None
-            log.info("No markers section in coords file — 8-marker detection unavailable")
+            log.info("No markers section in coords file — marker detection unavailable")
         r_sample = list(circles.values())[0]["A"][2]
         log.info(
             "Sheet coords loaded from %s — %d questions, r=%d px, dims=%s, exam_code=%s",
@@ -427,11 +437,13 @@ def find_corner_markers(gray: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# 8-marker detection (celular zone × 4 + respuestas zone × 4)
+# 12-marker detection (4 corner + 4 edge + 2 celular zone + 2 resp zone)
 # ---------------------------------------------------------------------------
 _MARKER_NAMES = [
-    "celular_TL", "celular_TR", "celular_BL", "celular_BR",
-    "resp_TL",    "resp_TR",    "resp_BL",    "resp_BR",
+    "corner_TL",   "corner_TR",   "corner_BL",   "corner_BR",
+    "edge_top",    "edge_bottom", "edge_left",   "edge_right",
+    "celular_TL",  "celular_TR",
+    "resp_TL",     "resp_TR",
 ]
 
 
@@ -467,7 +479,7 @@ def find_all_markers(gray: np.ndarray) -> "dict | None":
     candidates: list = []
     for thresh_val in _MARKER_THRESHOLDS:
         cands, total = _filter_marker_candidates(gray, thresh_val)
-        log.info("8-marker thresh=%d: %d raw → %d candidates", thresh_val, total, len(cands))
+        log.info("marker-detect thresh=%d: %d raw → %d candidates", thresh_val, total, len(cands))
         if len(cands) >= 4:
             candidates = cands
             break
@@ -477,18 +489,25 @@ def find_all_markers(gray: np.ndarray) -> "dict | None":
         return None
 
     # ── Normalised positions ──────────────────────────────────────────────────
+    # Only use names that are actually present in the loaded coords file,
+    # preserving the priority order defined in _MARKER_NAMES.
+    active_names = [n for n in _MARKER_NAMES if n in MARKER_TEMPLATE_POSITIONS]
+    if not active_names:
+        log.warning("find_all_markers: no matching marker names in MARKER_TEMPLATE_POSITIONS")
+        return None
+
     norm_cands = [(cx / w, cy / h) for cx, cy in candidates]
     tpl_norm   = {
         name: (MARKER_TEMPLATE_POSITIONS[name][0] / tw,
                MARKER_TEMPLATE_POSITIONS[name][1] / th)
-        for name in _MARKER_NAMES
+        for name in active_names
     }
 
     # ── Greedy match: template marker → nearest unused candidate ─────────────
     remaining = list(range(len(candidates)))  # indices into candidates[]
     matched: list = []   # (cand_idx, marker_name, dist)
 
-    for name in _MARKER_NAMES:
+    for name in active_names:
         if not remaining:
             break
         tx, ty = tpl_norm[name]
@@ -988,7 +1007,7 @@ def _run_perspective_correction(
     global _last_marker_result
     _last_marker_result = None
 
-    # Stage 1: 8-marker findHomography (4–8 markers, RANSAC robust)
+    # Stage 1: multi-marker findHomography (up to 12 markers, RANSAC robust)
     if MARKER_TEMPLATE_POSITIONS is not None:
         try:
             mr = find_all_markers(gray)
@@ -1319,13 +1338,17 @@ def debug_visual():
                 {nm for _, nm, _ in _last_marker_result["named"]}
                 if _last_marker_result else set()
             )
-            for mk_name, (mx, my) in MARKER_TEMPLATE_POSITIONS.items():
-                dx, dy   = int(mx * sc), int(my * sc)
+            for mk_name, mk_xy in MARKER_TEMPLATE_POSITIONS.items():
+                dx, dy   = int(mk_xy[0] * sc), int(mk_xy[1] * sc)
                 detected = mk_name in detected_names
-                if mk_name.startswith("celular"):
-                    color = (255, 100, 0)    # blue-orange: celular
+                if mk_name.startswith("corner"):
+                    color = (0, 180, 255)    # yellow: page corners
+                elif mk_name.startswith("edge"):
+                    color = (180, 0, 255)    # magenta: edge midpoints
+                elif mk_name.startswith("celular"):
+                    color = (255, 100, 0)    # blue-orange: celular zone
                 else:
-                    color = (30, 200, 30)    # green: respuestas
+                    color = (30, 200, 30)    # green: respuestas zone
                 if not detected:
                     color = (30, 30, 220)    # red: not found in photo
                 cv2.rectangle(vis, (dx - mk_half, dy - mk_half),
