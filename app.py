@@ -78,6 +78,8 @@ _TEMPLATE_IMAGE:    np.ndarray | None = None  # rendered reference image for ORB
 _last_orb_viz:      np.ndarray | None = None  # last drawMatches output for /debug-visual
 _COORDS_EXAM_CODE:        str | None = None  # exam_code from the last loaded coords file
 _COORDS_TOTAL_PREGUNTAS:  int        = 90    # total_preguntas from last loaded coords file
+CELULAR_COORDS:     dict | None = None   # celular bubble grid coords (10×10)
+CELULAR_R_PX:       int         = 29     # celular bubble radius in px (R_CEL * PT_PX)
 
 # 12-marker detection
 # {"corner_TL":[x,y], …} — pixel space (template dims)
@@ -158,6 +160,7 @@ def _load_sheet_coords_file(path: str) -> bool:
     """
     global TEMPLATE_CIRCLES, TEMPLATE_DIMS, COORDS_SOURCE, _COORDS_EXAM_CODE
     global MARKER_TEMPLATE_POSITIONS, _COORDS_TOTAL_PREGUNTAS
+    global CELULAR_COORDS, CELULAR_R_PX
     if not os.path.exists(path):
         return False
     try:
@@ -170,8 +173,11 @@ def _load_sheet_coords_file(path: str) -> bool:
         TEMPLATE_CIRCLES         = circles
         TEMPLATE_DIMS            = (_LETTER_W_PX, _LETTER_H_PX)
         COORDS_SOURCE            = "sheet_coords"
-        _COORDS_EXAM_CODE        = data.get("exam_code")   # may be None for bare-format files
+        _COORDS_EXAM_CODE        = data.get("exam_code")
         _COORDS_TOTAL_PREGUNTAS  = int(data.get("total_preguntas", len(circles)))
+        CELULAR_COORDS           = coords.get("celular") or None
+        from generate_sheet import R_CEL, PT_PX as _PT_PX
+        CELULAR_R_PX             = int(coords.get("r_celular_px") or round(R_CEL * _PT_PX))
         # Load marker template positions if present.
         # Supports both formats:
         #   old: {"name": [x, y]}
@@ -1083,9 +1089,38 @@ def _binarize_warped(warped_color: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Celular grid reader
+# ---------------------------------------------------------------------------
+def read_celular_grid(binary: np.ndarray, celular: dict, r_px: int) -> str:
+    """
+    Read a 10-digit phone number from the celular bubble grid.
+
+    For each of the 10 columns (digit positions), finds the row (0-9) with the
+    highest dark-pixel fraction above FILL_THRESHOLD.  Returns a 10-char string;
+    columns with no clear mark produce '?'.
+    """
+    result = ""
+    for col in range(10):
+        col_data  = celular.get(str(col), {})
+        best_frac = 0.0
+        best_dig  = None
+        for dig in range(10):
+            coords = col_data.get(str(dig))
+            if coords is None:
+                continue
+            frac = _bubble_dark_fraction(binary, int(coords[0]), int(coords[1]), r_px)
+            if frac > best_frac and frac > FILL_THRESHOLD:
+                best_frac = frac
+                best_dig  = str(dig)
+        result += best_dig or "?"
+    log.debug("Celular grid result: %s", result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Core OMR pipeline
 # ---------------------------------------------------------------------------
-def process_omr(img: np.ndarray, total_preguntas: int) -> dict:
+def process_omr(img: np.ndarray, total_preguntas: int, leer_celular: bool = False) -> dict:
     """
     Full OMR pipeline with a 3-stage perspective correction fallback.
     The active stage is recorded in LAST_PERSPECTIVE_MODE.
@@ -1106,13 +1141,21 @@ def process_omr(img: np.ndarray, total_preguntas: int) -> dict:
     total_detectadas = sum(1 for v in respuestas.values() if v is not None)
     confianza        = round(total_detectadas / total_preguntas, 4) if total_preguntas else 0.0
 
-    return {
+    result = {
         "ok":               True,
         "respuestas":       respuestas,
         "total_detectadas": total_detectadas,
         "confianza":        confianza,
         "perspective_mode": mode,
+        "celular_alumno":   None,
     }
+
+    if leer_celular and CELULAR_COORDS is not None:
+        result["celular_alumno"] = read_celular_grid(warped_bin, CELULAR_COORDS, CELULAR_R_PX)
+    elif leer_celular:
+        log.warning("leer_celular=True pero CELULAR_COORDS no está cargado")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1254,6 +1297,8 @@ def procesar():
     if COORDS_SOURCE == "sheet_coords" and _COORDS_TOTAL_PREGUNTAS > 0:
         total_preguntas = _COORDS_TOTAL_PREGUNTAS
 
+    leer_celular = bool(data.get("leer_celular", False))
+
     # Load per-exam coords on demand (only when not using HoughCircles state).
     exam_code = data.get("exam_code")
     if exam_code and COORDS_SOURCE != "setup_template":
@@ -1275,7 +1320,7 @@ def procesar():
         return jsonify({"ok": False, "error": f"Image decode error: {exc}"}), 422
 
     try:
-        result = process_omr(img, total_preguntas)
+        result = process_omr(img, total_preguntas, leer_celular=leer_celular)
         result["coords_source"] = COORDS_SOURCE
         log.info(
             "OMR OK — detectadas=%d confianza=%.4f source=%s",

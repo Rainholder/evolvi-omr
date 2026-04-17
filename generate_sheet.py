@@ -359,7 +359,12 @@ def compute_sheet_coords(total_preguntas: int = 90) -> dict:
         "resp_TR":     _cm(RESP_MARKER_R, Y_RESP_MARKER_TOP, MARKER_SMALL, "small"),
     }
 
-    return {"celular": celular, "respuestas": respuestas, "markers": markers}
+    return {
+        "celular":       celular,
+        "respuestas":    respuestas,
+        "markers":       markers,
+        "r_celular_px":  round(R_CEL * PT_PX),
+    }
 
 
 # ---------------------------------------------------------------------------
