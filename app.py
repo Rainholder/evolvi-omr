@@ -1118,6 +1118,22 @@ def process_omr(img: np.ndarray, total_preguntas: int) -> dict:
 # ---------------------------------------------------------------------------
 # Flask endpoints
 # ---------------------------------------------------------------------------
+# Helper: resolve total_preguntas from query param → coords file → default 90
+# ---------------------------------------------------------------------------
+def _resolve_total_preguntas(safe_code: str, requested: "int | None") -> int:
+    if requested is not None:
+        return max(1, min(540, int(requested)))
+    for path in (f"{safe_code}_coords.json", _SHEET_COORDS_FILE):
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    tp = json.load(f).get("total_preguntas")
+                if tp:
+                    return int(tp)
+            except Exception:
+                pass
+    return 90
+
 
 @app.route("/setup-template", methods=["POST"])
 def setup_template():
@@ -1723,26 +1739,29 @@ def get_coords(exam_code: str):
     """
     log.info("GET /coords/%s", exam_code)
 
+    safe_code       = exam_code.upper().replace("/", "-").replace(" ", "_")
+    total_preguntas = _resolve_total_preguntas(safe_code, request.args.get("preguntas", type=int))
+
     try:
         info   = parse_exam_code(exam_code)
-        coords = compute_sheet_coords()
+        coords = compute_sheet_coords(total_preguntas)
     except Exception as exc:
         log.error("Coords computation failed: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
 
-    # Bubble radius in pixels at 300 DPI (R_RESP = 10 pt)
     from generate_sheet import R_RESP, PT_PX
     r_px = round(R_RESP * PT_PX)
 
     return jsonify({
-        "ok":             True,
-        "exam_code":      info["code"],
-        "title":          info["title"],
-        "total_questions": len(coords["respuestas"]),
+        "ok":               True,
+        "exam_code":        info["code"],
+        "title":            info["title"],
+        "total_preguntas":  total_preguntas,
+        "total_questions":  len(coords["respuestas"]),
         "bubble_radius_px": r_px,
-        "dpi":            300,
-        "image_size_px":  [2550, 3300],
-        "coords":         coords,
+        "dpi":              300,
+        "image_size_px":    [2550, 3300],
+        "coords":           coords,
     }), 200
 
 
@@ -1781,7 +1800,7 @@ def exam_config(exam_code: str):
     # Load coords: try per-exam file first, then compute fresh
     safe_code       = exam_code.upper().replace("/", "-").replace(" ", "_")
     coords: dict | None = None
-    total_preguntas = 90
+    file_preguntas  = None
     for path in (f"{safe_code}_coords.json", _SHEET_COORDS_FILE):
         if os.path.exists(path):
             try:
@@ -1789,14 +1808,18 @@ def exam_config(exam_code: str):
                     data = json.load(f)
                 raw = data["coords"] if "coords" in data else data
                 if "markers" in raw:
-                    coords          = raw
-                    total_preguntas = int(data.get("total_preguntas", len(raw.get("respuestas", {})) or 90))
+                    coords         = raw
+                    file_preguntas = data.get("total_preguntas") or len(raw.get("respuestas", {})) or None
                     break
             except Exception:
                 pass
+    total_preguntas = _resolve_total_preguntas(
+        safe_code,
+        request.args.get("preguntas", type=int) or (int(file_preguntas) if file_preguntas else None),
+    )
     if coords is None:
         try:
-            coords = compute_sheet_coords()
+            coords = compute_sheet_coords(total_preguntas)
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -1865,14 +1888,19 @@ def sheet_preview(exam_code: str):
 
     log.info("GET /sheet-preview/%s", exam_code)
 
-    # -- fast path: in-memory image matches requested code ----------------
-    if _TEMPLATE_IMAGE is not None and _COORDS_EXAM_CODE == exam_code:
+    safe_code       = exam_code.upper().replace("/", "-").replace(" ", "_")
+    total_preguntas = _resolve_total_preguntas(safe_code, request.args.get("preguntas", type=int))
+
+    # -- fast path: in-memory image matches code AND question count -------
+    if (_TEMPLATE_IMAGE is not None
+            and _COORDS_EXAM_CODE == exam_code
+            and _COORDS_TOTAL_PREGUNTAS == total_preguntas):
         img_to_serve = _TEMPLATE_IMAGE
     else:
         # -- slow path: render from PDF on the fly -----------------------
         try:
             from pdf2image import convert_from_bytes  # noqa: PLC0415
-            pdf_bytes, _ = build_sheet(exam_code)
+            pdf_bytes, _ = build_sheet(exam_code, total_preguntas)
             pages = convert_from_bytes(pdf_bytes, dpi=150)
             if not pages:
                 return jsonify({"ok": False, "error": "pdf2image returned no pages"}), 500
