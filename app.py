@@ -55,7 +55,7 @@ N_OPTIONS = 3    # A, B, C
 TOTAL_BUBBLES = N_COLS * N_ROWS * N_OPTIONS   # 270
 
 # Minimum dark-pixel fraction to declare a bubble "filled".
-FILL_THRESHOLD = 0.18
+FILL_THRESHOLD = 0.10
 
 # ---------------------------------------------------------------------------
 # Global OMR state
@@ -971,13 +971,15 @@ def read_bubbles(binary_warped: np.ndarray, circles_map: dict, total_preguntas: 
             cx, cy, r = int(coords[0]), int(coords[1]), int(coords[2])
             fractions[opt] = _bubble_dark_fraction(binary_warped, cx, cy, r)
 
-        best_opt  = max(fractions, key=fractions.get)
-        best_frac = fractions[best_opt]
+        best_opt    = max(fractions, key=fractions.get)
+        best_frac   = fractions[best_opt]
+        sorted_vals = sorted(fractions.values(), reverse=True)
+        second_frac = sorted_vals[1] if len(sorted_vals) > 1 else 0.0
 
         if q <= 5:
-            sample_log.append(f"  Q{q}: {fractions} → {best_opt}={best_frac:.3f}")
+            sample_log.append(f"  Q{q}: {fractions} → {best_opt}={best_frac:.3f} Δ={best_frac - second_frac:.3f}")
 
-        if best_frac >= FILL_THRESHOLD:
+        if best_frac >= FILL_THRESHOLD and (best_frac - second_frac) > 0.04:
             results[q_str] = best_opt
             filled_count  += 1
         else:
@@ -1052,6 +1054,32 @@ def _run_perspective_correction(
 
 
 # ---------------------------------------------------------------------------
+# Image enhancement: CLAHE + sharpening + fixed threshold
+# ---------------------------------------------------------------------------
+def _binarize_warped(warped_color: np.ndarray) -> np.ndarray:
+    """
+    Convert a perspective-corrected color image to a binary image ready for
+    bubble reading.
+
+    Pipeline:
+      1. Grayscale conversion.
+      2. CLAHE (clipLimit=3.0, 8×8 tiles) — local contrast enhancement.
+      3. Unsharp-mask sharpening kernel.
+      4. Fixed threshold at 160 (THRESH_BINARY): dark marks → 0, background → 255.
+         This keeps _bubble_dark_fraction's 'count pixels == 0' logic valid.
+    """
+    gray     = cv2.cvtColor(warped_color, cv2.COLOR_BGR2GRAY)
+    clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    kernel   = np.array([[-1, -1, -1],
+                         [-1,  9, -1],
+                         [-1, -1, -1]], dtype=np.float32)
+    sharpened = cv2.filter2D(enhanced, -1, kernel)
+    _, binary = cv2.threshold(sharpened, 160, 255, cv2.THRESH_BINARY)
+    return binary
+
+
+# ---------------------------------------------------------------------------
 # Core OMR pipeline
 # ---------------------------------------------------------------------------
 def process_omr(img: np.ndarray, total_preguntas: int) -> dict:
@@ -1070,10 +1098,7 @@ def process_omr(img: np.ndarray, total_preguntas: int) -> dict:
     warped_color, _corners, mode      = _run_perspective_correction(img, gray)
     LAST_PERSPECTIVE_MODE             = mode
 
-    warped_gray = cv2.cvtColor(warped_color, cv2.COLOR_BGR2GRAY)
-    blurred     = cv2.GaussianBlur(warped_gray, (5, 5), 0)
-    _, warped_bin = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
+    warped_bin       = _binarize_warped(warped_color)
     respuestas       = read_bubbles(warped_bin, TEMPLATE_CIRCLES, total_preguntas)
     total_detectadas = sum(1 for v in respuestas.values() if v is not None)
     confianza        = round(total_detectadas / total_preguntas, 4) if total_preguntas else 0.0
@@ -1310,9 +1335,7 @@ def debug_visual():
         global LAST_PERSPECTIVE_MODE
         LAST_PERSPECTIVE_MODE        = mode
 
-        warped_gray = cv2.cvtColor(warped_color, cv2.COLOR_BGR2GRAY)
-        blurred     = cv2.GaussianBlur(warped_gray, (5, 5), 0)
-        _, warped_bin = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        warped_bin = _binarize_warped(warped_color)
         respuestas = read_bubbles(warped_bin, TEMPLATE_CIRCLES, total_preguntas)
 
         total_det  = sum(1 for v in respuestas.values() if v is not None)
@@ -1777,7 +1800,13 @@ def exam_config(exam_code: str):
         tl_x = cx - size // 2
         tl_y = cy - size // 2
 
-        corner_markers[label] = {"x_px": tl_x, "y_px": tl_y, "size_px": size}
+        corner_markers[label] = {
+            "x_px":   tl_x,
+            "y_px":   tl_y,
+            "size_px": size,
+            "x_norm": round(cx / W, 3),
+            "y_norm": round(cy / H, 3),
+        }
 
         x_norm = round(max(0.0, tl_x / W - MARGIN), 3)
         y_norm = round(max(0.0, tl_y / H - MARGIN), 3)
