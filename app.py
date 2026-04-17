@@ -1706,6 +1706,100 @@ def get_coords(exam_code: str):
     }), 200
 
 
+@app.route("/exam-config/<exam_code>", methods=["GET"])
+def exam_config(exam_code: str):
+    """
+    Return camera-configuration data for the given exam code.
+
+    Response:
+        {
+          "ok": true,
+          "exam_code": "EV-ATR-JUN26",
+          "sheet": {"width_px": 2550, "height_px": 3300, "width_pt": 612, "height_pt": 792},
+          "corner_markers": {
+            "TL": {"x_px": N, "y_px": N, "size_px": N},
+            ...
+          },
+          "detection_zones": {
+            "TL": {"x_norm": N, "y_norm": N, "w_norm": N, "h_norm": N},
+            ...
+          }
+        }
+
+    corner_markers x_px/y_px are the top-left corner of each square marker.
+    detection_zones add a 0.02 normalized margin on every side of the marker.
+    """
+    log.info("GET /exam-config/%s", exam_code)
+
+    from generate_sheet import PT_PX, compute_sheet_coords, parse_exam_code
+
+    try:
+        info = parse_exam_code(exam_code)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    # Load coords: try per-exam file first, then compute fresh
+    safe_code = exam_code.upper().replace("/", "-").replace(" ", "_")
+    coords: dict | None = None
+    for path in (f"{safe_code}_coords.json", _SHEET_COORDS_FILE):
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                raw = data["coords"] if "coords" in data else data
+                if "markers" in raw:
+                    coords = raw
+                    break
+            except Exception:
+                pass
+    if coords is None:
+        try:
+            coords = compute_sheet_coords()
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    markers = coords.get("markers", {})
+    W, H = _LETTER_W_PX, _LETTER_H_PX
+    MARGIN = 0.02
+
+    corner_map = {"TL": "corner_TL", "TR": "corner_TR", "BL": "corner_BL", "BR": "corner_BR"}
+    corner_markers: dict = {}
+    detection_zones: dict = {}
+
+    for label, key in corner_map.items():
+        m = markers.get(key)
+        if m is None:
+            return jsonify({"ok": False, "error": f"Missing marker: {key}"}), 500
+        cx   = int(m["x"]) if isinstance(m, dict) else int(m[0])
+        cy   = int(m["y"]) if isinstance(m, dict) else int(m[1])
+        pt   = m["pt"] if isinstance(m, dict) else 16
+        size = round(pt * PT_PX)
+        tl_x = cx - size // 2
+        tl_y = cy - size // 2
+
+        corner_markers[label] = {"x_px": tl_x, "y_px": tl_y, "size_px": size}
+
+        x_norm = round(max(0.0, tl_x / W - MARGIN), 3)
+        y_norm = round(max(0.0, tl_y / H - MARGIN), 3)
+        w_norm = round(size / W + 2 * MARGIN, 3)
+        h_norm = round(size / H + 2 * MARGIN, 3)
+        detection_zones[label] = {"x_norm": x_norm, "y_norm": y_norm,
+                                   "w_norm": w_norm, "h_norm": h_norm}
+
+    return jsonify({
+        "ok":        True,
+        "exam_code": info["code"],
+        "sheet": {
+            "width_px":  W,
+            "height_px": H,
+            "width_pt":  612,
+            "height_pt": 792,
+        },
+        "corner_markers":  corner_markers,
+        "detection_zones": detection_zones,
+    }), 200
+
+
 @app.route("/sheet-preview/<exam_code>", methods=["GET"])
 def sheet_preview(exam_code: str):
     """
