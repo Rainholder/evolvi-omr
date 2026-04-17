@@ -108,23 +108,23 @@ MARKER        = MARKER_SMALL   # alias used in drawing helpers
 
 # Large page-corner markers (16x16 pt)
 _CORNER_TL_X, _CORNER_TL_Y = 35,  35
-_CORNER_TR_X, _CORNER_TR_Y = 577, 35
-_CORNER_BL_X, _CORNER_BL_Y = 35,  757
-_CORNER_BR_X, _CORNER_BR_Y = 577, 757
+_CORNER_TR_X, _CORNER_TR_Y = 560, 35
+_CORNER_BL_X, _CORNER_BL_Y = 35,  640
+_CORNER_BR_X, _CORNER_BR_Y = 560, 640
 
 # Medium edge-centre markers (10x10 pt)
 _EDGE_TOP_X,    _EDGE_TOP_Y    = 306, 35    # horizontally centred: 306+5 = 311 ~ 612/2
-_EDGE_BOTTOM_X, _EDGE_BOTTOM_Y = 306, 757
-_EDGE_LEFT_X,   _EDGE_LEFT_Y   = 35,  396   # vertically centred: 396+5 = 401 ~ 792/2
-_EDGE_RIGHT_X,  _EDGE_RIGHT_Y  = 577, 396
+_EDGE_BOTTOM_X, _EDGE_BOTTOM_Y = 306, 640
+_EDGE_LEFT_X,   _EDGE_LEFT_Y   = 35,  320   # vertically centred: 396+5 = 401 ~ 792/2
+_EDGE_RIGHT_X,  _EDGE_RIGHT_Y  = 560, 320
 
 # ---------------------------------------------------------------------------
 # Two-column split
 # ---------------------------------------------------------------------------
-LEFT_X      = 35     # = MARGIN
+LEFT_X      = 60     # = MARGIN
 LEFT_X_END  = 330    # left col end
 RIGHT_X     = 345    # right col start (15 pt gap)
-RIGHT_X_END = 577    # right col end = 612 - MARGIN (was 592)
+RIGHT_X_END = 550    # right col end = 612 - MARGIN (was 592)
 
 # ---------------------------------------------------------------------------
 # CELULAR layout (right column, width 232 pt)
@@ -156,25 +156,25 @@ RESP_MARKER_R = RIGHT_X_END - MARKER_SMALL       # = 569 pt
 
 # ── Celular section ──────────────────────────────────────────────────────────
 Y_CEL_MARKER_TOP = 35    # = MARGIN  (same y as large TL/TR corners; different x)
-Y_CEL_LABEL      = 55    # "CELULAR" text baseline
-Y_CEL_SQ_TOP     = 60    # digit-input squares top edge
-Y_CEL_SQ_BOT     = 82    # = Y_CEL_SQ_TOP + CEL_SQ_SIZE
-Y_CEL_ROW0       = 92    # first bubble-row centre  (digit 0)
+Y_CEL_LABEL      = 60    # "CELULAR" text baseline
+Y_CEL_SQ_TOP     = 65    # digit-input squares top edge
+Y_CEL_SQ_BOT     = 85    # = Y_CEL_SQ_TOP + CEL_SQ_SIZE
+Y_CEL_ROW0       = 95    # first bubble-row centre  (digit 0)
 #   Last row centre   : Y_CEL_ROW0 + 9 x 20 = 272 pt
 #   Last bubble bottom: 272 + R_CEL = 279 pt
 Y_CEL_MARKER_BOT = 282   # bottom small zone markers  (bottom edge = 290)
 
 # ── Left column ──────────────────────────────────────────────────────────────
-Y_TITLE      = 55    # exam title baseline (14 pt bold)
-Y_CODE       = 72    # exam code baseline  (11 pt)
-Y_NOMBRE_LBL = 86    # "NOMBRE(S):" label baseline
-Y_NOMBRE_TOP = 90    # NOMBRE rect top edge
-Y_NOMBRE_BOT = 118   # = Y_NOMBRE_TOP + 28 pt
-Y_APELL_LBL  = 130   # "APELLIDO(S):" label baseline
-Y_APELL_TOP  = 133   # APELLIDOS rect top edge
-Y_APELL_BOT  = 161   # = Y_APELL_TOP + 28 pt
-Y_INST_LBL   = 175   # "INSTRUCCIONES:" label baseline
-Y_INST_TEXT  = 185   # first instruction text-line baseline
+Y_TITLE      = 70    # exam title baseline (14 pt bold)
+Y_CODE       = 87    # exam code baseline  (11 pt)
+Y_NOMBRE_LBL = 101    # "NOMBRE(S):" label baseline
+Y_NOMBRE_TOP = 105    # NOMBRE rect top edge
+Y_NOMBRE_BOT = 133   # = Y_NOMBRE_TOP + 28 pt
+Y_APELL_LBL  = 145   # "APELLIDO(S):" label baseline
+Y_APELL_TOP  = 148   # APELLIDOS rect top edge
+Y_APELL_BOT  = 176   # = Y_APELL_TOP + 28 pt
+Y_INST_LBL   = 190   # "INSTRUCCIONES:" label baseline
+Y_INST_TEXT  = 200   # first instruction text-line baseline
 
 _LEFT_COL_BOTTOM = 285   # max y the left column may reach before separator
 
@@ -188,8 +188,8 @@ Y_RESP_ROW0      = 326   # first question-row bubble centre
 N_COLS    = 6
 N_ROWS    = 15
 R_RESP    = 6.5   # pt radius  (diameter 13 pt, was 16)
-OPT_STEP  = 20    # pt horizontal centre-to-centre A->B and B->C
-QROW_STEP = 22    # pt vertical centre-to-centre between questions
+OPT_STEP  = 18    # pt horizontal centre-to-centre A->B and B->C
+QROW_STEP = 21    # pt vertical centre-to-centre between questions
 
 #   Last row centre   : Y_RESP_ROW0 + 14 x 22 = 634 pt
 #   Last bubble bottom: 634 + R_RESP = 640.5 pt
@@ -199,8 +199,8 @@ Y_FOOTER          = 778  # footer text baseline (below BL/BR markers at 757-773)
 # Respuestas column geometry
 # Content starts 2 pt after the right edge of the RESP_MARKER_L square.
 _RESP_CONTENT_X0 = LEFT_X + MARKER_SMALL + 2   # = 45 pt
-_RESP_COL_PITCH  = 87    # pt between column starts  (6 x 87 = 522 pt; fits in 45-657)
-_RESP_NUM_W      = 13    # pt reserved for question-number label
+_RESP_COL_PITCH  = 79    # pt between column starts  (6 x 87 = 522 pt; fits in 45-657)
+_RESP_NUM_W      = 14    # pt reserved for question-number label
 
 #   A_cx(col) = _RESP_CONTENT_X0 + _RESP_NUM_W + R_RESP + col x _RESP_COL_PITCH
 #             = 45 + 13 + 6.5 + col x 87  =  64.5 + col x 87
