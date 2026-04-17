@@ -33,6 +33,7 @@ matching a 2550×3300 px image.  Conversion: px = pt × (300/72).
 import io
 import json
 import logging
+import math
 from pathlib import Path
 
 from reportlab.lib import colors
@@ -267,9 +268,31 @@ def _cel_cy(row: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Dynamic question distribution across columns
+# ---------------------------------------------------------------------------
+def _questions_per_col(total_preguntas: int) -> list[int]:
+    """
+    Distribute total_preguntas across N_COLS columns as evenly as possible,
+    front-loading any remainder so the first columns are never shorter.
+
+    Example: 50 → [9, 9, 8, 8, 8, 8]  (sum = 50)
+    Example: 24 → [4, 4, 4, 4, 4, 4]  (sum = 24)
+    Example: 90 → [15, 15, 15, 15, 15, 15]
+    """
+    result: list[int] = []
+    remaining = total_preguntas
+    for col in range(N_COLS):
+        cols_left = N_COLS - col
+        n = min(math.ceil(remaining / cols_left), remaining)
+        result.append(n)
+        remaining -= n
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Compute SHEET_COORDS dict
 # ---------------------------------------------------------------------------
-def compute_sheet_coords() -> dict:
+def compute_sheet_coords(total_preguntas: int = 90) -> dict:
     """
     Build the complete SHEET_COORDS dict in pixel space (300 DPI, top-left origin).
 
@@ -294,15 +317,19 @@ def compute_sheet_coords() -> dict:
         }
     """
     opts = ["A", "B", "C"]
+    rows_per_col = _questions_per_col(total_preguntas)
 
     respuestas: dict = {}
+    offset = 0
     for col in range(N_COLS):
-        for row in range(N_ROWS):
-            q  = col * N_ROWS + row + 1
+        col_rows = rows_per_col[col]
+        for row in range(col_rows):
+            q  = offset + row + 1
             cy = _resp_cy(row)
             respuestas[str(q)] = {
                 opts[i]: _pt2px(_resp_cx(col, i), cy) for i in range(3)
             }
+        offset += col_rows
 
     celular: dict = {}
     for pos in range(N_CEL_COLS):
@@ -404,14 +431,20 @@ def _wrap_text(c, text: str, x: float, y_from_top: float,
 # ---------------------------------------------------------------------------
 # Main builder
 # ---------------------------------------------------------------------------
-def build_sheet(exam_code: str) -> tuple[bytes, dict]:
+def build_sheet(exam_code: str, total_preguntas: int = 90) -> tuple[bytes, dict]:
     """
     Generate the EVOLVI answer-sheet PDF.
+
+    Args:
+        exam_code        : e.g. "EV-ATR-JUN26"
+        total_preguntas  : number of questions to render (default 90)
 
     Returns:
         pdf_bytes    : raw PDF bytes
         sheet_coords : SHEET_COORDS dict for OMR bubble detection
     """
+    total_preguntas = max(1, min(540, total_preguntas))
+    rows_per_col    = _questions_per_col(total_preguntas)
     info = parse_exam_code(exam_code)
     log.info("Building sheet: code=%s  title=%s", info["code"], info["title"])
 
@@ -548,23 +581,27 @@ def build_sheet(exam_code: str) -> tuple[bytes, dict]:
     c.setFont("Helvetica-Bold", 6)
     c.setFillColor(colors.Color(0.35, 0.35, 0.35))
     for col in range(N_COLS):
+        if rows_per_col[col] == 0:
+            continue
         for i, opt in enumerate(opts):
             c.drawCentredString(_resp_cx(col, i), _y(Y_RESP_HDRS), opt)
 
     # ── Bubbles + question numbers ────────────────────────────────────────────
+    offset = 0
     for col in range(N_COLS):
-        for row in range(N_ROWS):
-            q_num = col * N_ROWS + row + 1
+        col_rows = rows_per_col[col]
+        for row in range(col_rows):
+            q_num = offset + row + 1
             cy    = _resp_cy(row)
             a_cx  = _resp_cx(col, 0)
 
-            # Question number right-aligned just left of bubble A
             c.setFont("Helvetica-Bold", 5.5)
             c.setFillColor(colors.black)
             c.drawRightString(a_cx - R_RESP - 2, _y(cy) - 2, str(q_num))
 
             for i, opt in enumerate(opts):
                 _bubble(c, _resp_cx(col, i), cy, R_RESP, label=opt, font_size=6)
+        offset += col_rows
 
     # =========================================================================
     # FOOTER
@@ -580,11 +617,12 @@ def build_sheet(exam_code: str) -> tuple[bytes, dict]:
     c.showPage()
     c.save()
 
-    sheet_coords = compute_sheet_coords()
+    sheet_coords = compute_sheet_coords(total_preguntas)
 
     # ── Layout verification ───────────────────────────────────────────────────
+    n_rows_max       = max(rows_per_col) if rows_per_col else 1
     _last_cel_row_y  = Y_CEL_ROW0  + (N_CEL_ROWS - 1) * CEL_ROW_STEP
-    _last_resp_row_y = Y_RESP_ROW0 + (N_ROWS - 1)     * QROW_STEP
+    _last_resp_row_y = Y_RESP_ROW0 + (n_rows_max - 1)  * QROW_STEP
     _inst_end_y      = Y_INST_TEXT + n_inst_lines * _INST_LINE_H
 
     print("=" * 62)

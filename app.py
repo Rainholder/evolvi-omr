@@ -76,7 +76,8 @@ _SHEET_COORDS_FILE = "sheet_coords.json"     # PDF-geometry coords (auto-loaded 
 _TEMPLATE_IMAGE_FILE = "template_image.png"
 _TEMPLATE_IMAGE:    np.ndarray | None = None  # rendered reference image for ORB alignment
 _last_orb_viz:      np.ndarray | None = None  # last drawMatches output for /debug-visual
-_COORDS_EXAM_CODE:  str | None        = None  # exam_code from the last loaded coords file
+_COORDS_EXAM_CODE:        str | None = None  # exam_code from the last loaded coords file
+_COORDS_TOTAL_PREGUNTAS:  int        = 90    # total_preguntas from last loaded coords file
 
 # 12-marker detection
 # {"corner_TL":[x,y], …} — pixel space (template dims)
@@ -156,7 +157,7 @@ def _load_sheet_coords_file(path: str) -> bool:
     calling _render_template_image(_COORDS_EXAM_CODE) when appropriate.
     """
     global TEMPLATE_CIRCLES, TEMPLATE_DIMS, COORDS_SOURCE, _COORDS_EXAM_CODE
-    global MARKER_TEMPLATE_POSITIONS
+    global MARKER_TEMPLATE_POSITIONS, _COORDS_TOTAL_PREGUNTAS
     if not os.path.exists(path):
         return False
     try:
@@ -166,10 +167,11 @@ def _load_sheet_coords_file(path: str) -> bool:
         coords     = data["coords"] if "coords" in data else data
         respuestas = coords["respuestas"]
         circles    = _sheet_respuestas_to_circles(respuestas)
-        TEMPLATE_CIRCLES  = circles
-        TEMPLATE_DIMS     = (_LETTER_W_PX, _LETTER_H_PX)
-        COORDS_SOURCE     = "sheet_coords"
-        _COORDS_EXAM_CODE = data.get("exam_code")   # may be None for bare-format files
+        TEMPLATE_CIRCLES         = circles
+        TEMPLATE_DIMS            = (_LETTER_W_PX, _LETTER_H_PX)
+        COORDS_SOURCE            = "sheet_coords"
+        _COORDS_EXAM_CODE        = data.get("exam_code")   # may be None for bare-format files
+        _COORDS_TOTAL_PREGUNTAS  = int(data.get("total_preguntas", len(circles)))
         # Load marker template positions if present.
         # Supports both formats:
         #   old: {"name": [x, y]}
@@ -222,7 +224,7 @@ def _load_template_image_file() -> bool:
         return False
 
 
-def _render_template_image(exam_code: str) -> bool:
+def _render_template_image(exam_code: str, total_preguntas: int = 90) -> bool:
     """
     Render the answer-sheet PDF for exam_code to a PNG at 150 DPI, save it as
     template_image.png, and load it into _TEMPLATE_IMAGE.
@@ -233,7 +235,7 @@ def _render_template_image(exam_code: str) -> bool:
     global _TEMPLATE_IMAGE
     try:
         from pdf2image import convert_from_bytes  # noqa: PLC0415
-        pdf_bytes, _ = build_sheet(exam_code)
+        pdf_bytes, _ = build_sheet(exam_code, total_preguntas)
         pages = convert_from_bytes(pdf_bytes, dpi=150)
         if not pages:
             log.warning("pdf2image returned no pages for exam_code=%s", exam_code)
@@ -272,7 +274,7 @@ def _bootstrap() -> None:
     if _load_sheet_coords_file(_SHEET_COORDS_FILE):
         # Coords loaded — immediately render the template image in memory.
         if _COORDS_EXAM_CODE:
-            _render_template_image(_COORDS_EXAM_CODE)
+            _render_template_image(_COORDS_EXAM_CODE, _COORDS_TOTAL_PREGUNTAS)
         else:
             log.warning(
                 "sheet_coords.json has no exam_code — ORB template image unavailable. "
@@ -296,9 +298,10 @@ def _try_render_template_from_coords_file() -> None:
     try:
         with open(_SHEET_COORDS_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        exam_code = data.get("exam_code")
+        exam_code       = data.get("exam_code")
+        total_preguntas = int(data.get("total_preguntas", 90))
         if exam_code:
-            _render_template_image(exam_code)
+            _render_template_image(exam_code, total_preguntas)
     except Exception as exc:
         log.warning("Could not read exam_code from %s for ORB render: %s", _SHEET_COORDS_FILE, exc)
 
@@ -1229,8 +1232,11 @@ def procesar():
         return jsonify({"ok": False, "error": "Missing field: imagen_base64"}), 400
 
     total_preguntas = data.get("total_preguntas", 90)
-    if not isinstance(total_preguntas, int) or not (1 <= total_preguntas <= 300):
-        return jsonify({"ok": False, "error": "total_preguntas must be an integer 1–300"}), 400
+    if not isinstance(total_preguntas, int) or not (1 <= total_preguntas <= 540):
+        return jsonify({"ok": False, "error": "total_preguntas must be an integer 1–540"}), 400
+    # Coords file is the source of truth for question count
+    if COORDS_SOURCE == "sheet_coords" and _COORDS_TOTAL_PREGUNTAS > 0:
+        total_preguntas = _COORDS_TOTAL_PREGUNTAS
 
     # Load per-exam coords on demand (only when not using HoughCircles state).
     exam_code = data.get("exam_code")
@@ -1306,8 +1312,11 @@ def debug_visual():
         return jsonify({"ok": False, "error": "Missing field: imagen_base64"}), 400
 
     total_preguntas = data.get("total_preguntas", 90)
-    if not isinstance(total_preguntas, int) or not (1 <= total_preguntas <= 300):
-        return jsonify({"ok": False, "error": "total_preguntas must be an integer 1-300"}), 400
+    if not isinstance(total_preguntas, int) or not (1 <= total_preguntas <= 540):
+        return jsonify({"ok": False, "error": "total_preguntas must be an integer 1–540"}), 400
+    # Coords file is the source of truth for question count
+    if COORDS_SOURCE == "sheet_coords" and _COORDS_TOTAL_PREGUNTAS > 0:
+        total_preguntas = _COORDS_TOTAL_PREGUNTAS
 
     # Load per-exam coords if needed (same logic as /procesar)
     exam_code = data.get("exam_code")
@@ -1632,15 +1641,22 @@ def get_sheet(exam_code: str):
     """
     log.info("GET /sheet/%s", exam_code)
 
+    total_preguntas = request.args.get("preguntas", 90, type=int)
+    total_preguntas = max(1, min(540, total_preguntas))
+
     try:
-        pdf_bytes, sheet_coords = build_sheet(exam_code)
+        pdf_bytes, sheet_coords = build_sheet(exam_code, total_preguntas)
     except Exception as exc:
         log.error("Sheet generation failed: %s\n%s", exc, traceback.format_exc())
         return jsonify({"ok": False, "error": str(exc)}), 500
 
     safe_code   = exam_code.upper().replace("/", "-").replace(" ", "_")
     per_exam    = f"{safe_code}_coords.json"
-    coords_data = {"exam_code": exam_code.upper(), "coords": sheet_coords}
+    coords_data = {
+        "exam_code":       exam_code.upper(),
+        "total_preguntas": total_preguntas,
+        "coords":          sheet_coords,
+    }
 
     # Persist coords — per-exam file and generic fallback
     for coords_path in (per_exam, _SHEET_COORDS_FILE):
@@ -1663,9 +1679,10 @@ def get_sheet(exam_code: str):
 
     # Always render the template image fresh (ephemeral FS on Render means
     # we cannot rely on a PNG surviving across redeploys — keep it in memory).
-    global _COORDS_EXAM_CODE
-    _COORDS_EXAM_CODE = safe_code
-    _render_template_image(safe_code)
+    global _COORDS_EXAM_CODE, _COORDS_TOTAL_PREGUNTAS
+    _COORDS_EXAM_CODE       = safe_code
+    _COORDS_TOTAL_PREGUNTAS = total_preguntas
+    _render_template_image(safe_code, total_preguntas)
 
     return send_file(
         io.BytesIO(pdf_bytes),
@@ -1762,8 +1779,9 @@ def exam_config(exam_code: str):
         return jsonify({"ok": False, "error": str(exc)}), 400
 
     # Load coords: try per-exam file first, then compute fresh
-    safe_code = exam_code.upper().replace("/", "-").replace(" ", "_")
+    safe_code       = exam_code.upper().replace("/", "-").replace(" ", "_")
     coords: dict | None = None
+    total_preguntas = 90
     for path in (f"{safe_code}_coords.json", _SHEET_COORDS_FILE):
         if os.path.exists(path):
             try:
@@ -1771,7 +1789,8 @@ def exam_config(exam_code: str):
                     data = json.load(f)
                 raw = data["coords"] if "coords" in data else data
                 if "markers" in raw:
-                    coords = raw
+                    coords          = raw
+                    total_preguntas = int(data.get("total_preguntas", len(raw.get("respuestas", {})) or 90))
                     break
             except Exception:
                 pass
@@ -1816,8 +1835,9 @@ def exam_config(exam_code: str):
                                    "w_norm": w_norm, "h_norm": h_norm}
 
     return jsonify({
-        "ok":        True,
-        "exam_code": info["code"],
+        "ok":              True,
+        "exam_code":       info["code"],
+        "total_preguntas": total_preguntas,
         "sheet": {
             "width_px":  W,
             "height_px": H,
